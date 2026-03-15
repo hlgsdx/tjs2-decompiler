@@ -1,3 +1,20 @@
+"""把 CFG 恢复成高级控制流结构的核心模块。
+
+这是整个项目里最“编译原理”的部分。它的职责不是逐条翻译指令，而是把
+低层的基本块网络重新识别成：
+
+- `if / else`
+- `while / do while / for`
+- `switch`
+- `try / catch`
+- 短路表达式 `a && b` / `a || b`
+
+一个很好用的理解方式是：
+`tjs2_decompiler.py` 负责“把每条指令看懂”，
+`tjs2_cfg.py` 负责“把跳转关系看懂”，
+而这里负责“把整体结构看懂”。
+"""
+
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -20,6 +37,7 @@ from tjs2_cfg import (
 )
 
 class RegionType(Enum):
+    """结构化恢复阶段识别出的区域类型。"""
     BLOCK = auto()
     SEQUENCE = auto()
     IF_THEN = auto()
@@ -33,6 +51,11 @@ class RegionType(Enum):
 
 @dataclass
 class LoopInfo:
+    """循环识别结果。
+
+    `loop_type` 目前会归类为 `while` / `do_while` / `infinite`。
+    `cond_block` 则记录条件判断主要发生在哪个基本块里。
+    """
     header: int
     back_edge_source: int
     body_blocks: Set[int]
@@ -43,6 +66,7 @@ class LoopInfo:
 
 @dataclass
 class SwitchCase:
+    """单个 switch case 的中间表示。"""
     value_expr: Optional[Expr]
     body_blocks: List[int]
     body_region: Optional['Region'] = None
@@ -54,6 +78,12 @@ class SwitchCase:
 
 @dataclass
 class Region:
+    """Region 树节点。
+
+    Region 是介于 CFG 和最终 AST 之间的一层中间表示。它的价值在于：
+    同一种高层结构只需在 `generate_code()` 中处理一次，而前面的识别逻辑
+    可以专心判断“这片基本块像不像某种结构”。
+    """
     type: RegionType
     header_block: int
     blocks: Set[int]
@@ -77,6 +107,7 @@ class Region:
     exception_reg: Optional[int] = None
 
 _DOWHILE_COND_PREAMBLE_OPS = frozenset({
+    # 这些指令被视为“可以安全放在 do-while 条件前导区”的纯计算或低风险操作。
     VM.CONST, VM.CP, VM.CL, VM.CCL,
     VM.GPD, VM.GPI, VM.GPDS, VM.GPIS, VM.GLOBAL,
     VM.ADD, VM.SUB, VM.MUL, VM.DIV, VM.MOD, VM.IDIV,
@@ -90,6 +121,7 @@ _DOWHILE_COND_PREAMBLE_OPS = frozenset({
 })
 
 def _block_dominates(cfg: CFG, a: int, b: int) -> bool:
+    """局部辅助：判断 a 是否支配 b。"""
     if a == b:
         return True
     current = b
@@ -105,6 +137,15 @@ def _block_dominates(cfg: CFG, a: int, b: int) -> bool:
     return False
 
 def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
+    """从 CFG 中识别循环。
+
+    基础思路是经典的“回边 + 自然循环”，但这里额外做了若干 TJS2 特化补丁：
+    - 把编译器生成的死跳转尾巴一并纳入循环范围；
+    - try/catch 落在循环内部时，扩大循环结束位置；
+    - 合并同一 header 上的多条回边。
+
+    这类补丁很关键，因为实际字节码往往不像教材里的 CFG 那么干净。
+    """
     back_edges = get_back_edges(cfg)
     loops = []
 
@@ -123,6 +164,8 @@ def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
                         and not block.predecessors
                         and block.terminator == 'jmp'
                         and block.start_idx >= loop_start_idx):
+                    # 某些编译器优化会留下“从死块直接跳回 loop header”的尾巴。
+                    # 如果不把它并进来，后面恢复 for/while 时会出现 body 缺块。
                     jmp_instr = instructions[block.end_idx - 1]
                     target_addr = jmp_instr.addr + jmp_instr.operands[0]
                     if target_addr == header_addr:
@@ -132,6 +175,8 @@ def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
             for block_id in list(body):
                 blk = cfg.get_block(block_id)
                 if blk and blk.terminator == 'entry':
+                    # try/catch 落在循环体内时，catch 块虽然不一定在自然循环里，
+                    # 但语义上仍属于这段循环需要覆盖的范围。
                     entry_instr = instructions[blk.end_idx - 1]
                     if entry_instr.op == VM.ENTRY:
                         catch_addr = entry_instr.addr + entry_instr.operands[0]
@@ -144,6 +189,9 @@ def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
             while changed:
                 changed = False
                 for block in cfg.blocks.values():
+                    # 这里是一个“向区间里补块”的闭包过程：
+                    # 只要块位于 loop 区间内、所有有效前驱都已在 body 中，
+                    # 且受 loop header 支配，就把它并进循环。
                     if block.id < 0 or block.id in body:
                         continue
                     if block.start_idx < loop_start_idx or block.end_idx > loop_end_idx:
@@ -183,6 +231,7 @@ def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
                     while changed:
                         changed = False
                         for block in cfg.blocks.values():
+                            # 第二轮扩张主要针对“条件尾 + 死跳回块”混合出现的情况。
                             if block.id < 0 or block.id in body:
                                 continue
                             if (block.start_idx < loop_start_idx
@@ -223,6 +272,7 @@ def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
         loop_type, cond_block = _classify_loop(cfg, instructions, header, tail, body, exit_blocks)
 
         if _is_switch_back_jump(cfg, instructions, header, tail, body):
+            # switch 链末尾也可能出现“跳回前面对比块”的形状，不能误判成循环。
             continue
 
         loops.append(LoopInfo(
@@ -240,6 +290,7 @@ def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
         h = loop.header
         header_tails.setdefault(h, []).append(loop.back_edge_source)
         if h in merged:
+            # 同一 header 可能对应多条回边，先把 body 合并，再统一重新分类。
             existing = merged[h]
             existing.body_blocks = existing.body_blocks | loop.body_blocks
             existing.exit_blocks = set()
@@ -286,6 +337,7 @@ def detect_loops(cfg: CFG, instructions: List[Instruction]) -> List[LoopInfo]:
 def _classify_loop(cfg: CFG, instructions: List[Instruction],
                    header: int, tail: int, body: Set[int],
                    exit_blocks: Set[int]) -> Tuple[str, Optional[int]]:
+    """把循环归类为 `while` / `do_while` / `infinite`。"""
     header_block = cfg.get_block(header)
     tail_block = cfg.get_block(tail)
 
@@ -314,6 +366,10 @@ def _classify_loop(cfg: CFG, instructions: List[Instruction],
                             return 'while', header
 
         if header_block.terminator in ('jf', 'jnf'):
+            # 这里允许一串“纯条件链”仍被视为 while。
+            # 例如源码里的：
+            #   while (a && b && c) { ... }
+            # 往往会被编译成多个条件块串联，而不是单个判断块。
             _NO_SIDE_EFFECT_OPS = frozenset({
                 VM.CONST, VM.CP, VM.CL, VM.CCL,
                 VM.CEQ, VM.CDEQ, VM.CLT, VM.CGT, VM.SETF, VM.SETNF,
@@ -369,6 +425,7 @@ def _classify_loop(cfg: CFG, instructions: List[Instruction],
 
 def _is_switch_back_jump(cfg: CFG, instructions: List[Instruction],
                           header: int, tail: int, body: Set[int]) -> bool:
+    """粗略识别“看起来像循环，其实更像 switch 比较链”的回边。"""
     header_block = cfg.get_block(header)
     if header_block is None:
         return False
@@ -401,6 +458,15 @@ def _is_switch_back_jump(cfg: CFG, instructions: List[Instruction],
 
 def _is_short_circuit_expr(cfg: CFG, instructions: List[Instruction],
                             block_id: int) -> Optional[int]:
+    """检测某个条件块是否属于短路表达式链。
+
+    典型例子：
+    - `a && b`
+    - `a || (b ? c : d)`
+
+    TJS2 常通过 `JF/JNF + SETF/SETNF` 来收束短路结果，这里返回一个结束下标，
+    供后面把整段区域包成 `RegionType.SC_EXPR`。
+    """
     block = cfg.get_block(block_id)
     if block is None or block.terminator not in ('jf', 'jnf'):
         return None
@@ -521,9 +587,11 @@ def _is_short_circuit_expr(cfg: CFG, instructions: List[Instruction],
 
 def _get_short_circuit_end_idx(cfg: CFG, instructions: List[Instruction],
                                  block_id: int) -> Optional[int]:
+    """短路表达式结束位置的薄包装，当前直接复用 `_is_short_circuit_expr()`。"""
     return _is_short_circuit_expr(cfg, instructions, block_id)
 
 def _detect_condition_chain(cfg: CFG, start_block_id: int, instructions: List[Instruction] = None) -> Optional[Tuple[List[int], int, int, Optional[int]]]:
+    """检测由多个条件块串成的 compound-if 链。"""
     CONDITION_BREAKING_OPS = frozenset({
         VM.SPD, VM.SPDE, VM.SPDEH, VM.SPDS, VM.SPI, VM.SPIE, VM.SPIS,
         VM.DELD, VM.DELI, VM.NEW,
@@ -806,6 +874,7 @@ def _detect_condition_chain(cfg: CFG, start_block_id: int, instructions: List[In
 
 def detect_switch_at(cfg: CFG, instructions: List[Instruction],
                      block_id: int) -> Optional[Dict]:
+    """检测某个条件块是否更像 switch case 比较链的开头。"""
     block = cfg.get_block(block_id)
     if block is None or block.terminator not in ('jf', 'jnf'):
         return None
@@ -828,6 +897,7 @@ def detect_switch_at(cfg: CFG, instructions: List[Instruction],
     if block.terminator != 'jnf':
         return None
 
+    # switch 比较链中，“被比较的参考寄存器”通常在整条链上保持不变。
     non_writing_ops = {VM.CEQ, VM.CDEQ, VM.CLT, VM.CGT, VM.CHKINS,
                        VM.TT, VM.TF, VM.NF, VM.JMP, VM.JF, VM.JNF,
                        VM.RET, VM.SRV, VM.THROW, VM.EXTRY, VM.ENTRY,
@@ -851,6 +921,7 @@ def detect_switch_at(cfg: CFG, instructions: List[Instruction],
 
     visited = set()
     while current is not None and current not in visited:
+        # 沿着“比较失败后继续下一个 case”的链往后追。
         visited.add(current)
         next_block = cfg.get_block(current)
         if next_block is None:
@@ -893,6 +964,7 @@ def detect_switch_at(cfg: CFG, instructions: List[Instruction],
 
 def detect_try_at(cfg: CFG, instructions: List[Instruction],
                   block_id: int) -> Optional[Dict]:
+    """检测某个块是否是 try/catch 的入口块。"""
     block = cfg.get_block(block_id)
     if block is None or block.terminator != 'entry':
         return None
@@ -909,6 +981,8 @@ def detect_try_at(cfg: CFG, instructions: List[Instruction],
     if catch_block_id is None:
         return None
 
+    # `ENTRY catch_offset, exception_reg` 可以理解为：
+    # “从下一块开始执行 try；若抛异常，则跳到 catch_block 并把异常对象写入 exception_reg”。
     try_body_start = block.end_idx
     try_body_start_id = try_body_start if try_body_start in cfg.blocks else None
 
@@ -921,6 +995,7 @@ def detect_try_at(cfg: CFG, instructions: List[Instruction],
 
 def build_region_tree(cfg: CFG, instructions: List[Instruction],
                       loops: List[LoopInfo]) -> Region:
+    """构建 Region 树的入口。"""
     loop_by_header = {loop.header: loop for loop in loops}
 
     processed = set()
@@ -940,6 +1015,20 @@ def _build_region_recursive(cfg: CFG, instructions: List[Instruction],
                              containing_loop: Optional[LoopInfo],
                              loop_blocks: Set[int],
                              switch_exit_addr: Optional[int] = None) -> Region:
+    """递归地从某个入口块向后吞并结构。
+
+    识别优先级大致是：
+    1. loop
+    2. try/catch
+    3. 短路表达式
+    4. switch
+    5. 条件链 if
+    6. 普通 if
+    7. 退化成单块
+
+    这种顺序不是随意的。比如短路表达式和 if 在 CFG 上都像条件分支，
+    如果先按 if 处理，就会把 `a && b` 错误抬升成语句级结构。
+    """
     children = []
     all_blocks = set()
     current = entry_block_id
@@ -950,9 +1039,11 @@ def _build_region_recursive(cfg: CFG, instructions: List[Instruction],
 
     while current is not None and current >= 0 and current not in processed:
         if valid_blocks is not None and current not in valid_blocks:
+            # 进入了当前递归允许范围之外的块，说明这一段 Region 到这里就该收口。
             break
 
         if current in visited_in_sequence:
+            # 顺序扫描时再次遇到同一块，说明出现了环或异常结构，交给上层处理。
             break
         visited_in_sequence.add(current)
 
@@ -962,6 +1053,7 @@ def _build_region_recursive(cfg: CFG, instructions: List[Instruction],
 
         if current in loop_by_header and current not in processed:
             loop_info = loop_by_header[current]
+            # 循环优先级最高，因为它通常会“包住”内部的 if/switch/try。
             loop_region = _build_loop_region(
                 cfg, instructions, loop_info, loop_by_header, processed,
                 switch_exit_addr=switch_exit_addr
@@ -986,6 +1078,8 @@ def _build_region_recursive(cfg: CFG, instructions: List[Instruction],
         if block.terminator in ('jf', 'jnf'):
             sc_end = _is_short_circuit_expr(cfg, instructions, current)
             if sc_end is not None:
+                # 短路表达式不直接生成语句，而是先打包成特殊 Region，
+                # 让后续代码生成阶段把它嵌回表达式树中。
                 remaining_blocks = set()
                 remaining_end = sc_end
                 for bid in sorted(cfg.blocks.keys()):
@@ -1046,6 +1140,7 @@ def _build_region_recursive(cfg: CFG, instructions: List[Instruction],
 
             chain_info = _detect_condition_chain(cfg, current, instructions)
             if chain_info is not None:
+                # 这里针对 `if (a && b && c)` 这类多块条件链做专门恢复。
                 chain_blocks, body_blk, else_blk, nf_blk_ids = chain_info
                 chain_valid = all(b not in processed for b in chain_blocks)
                 if chain_valid:
@@ -1078,6 +1173,7 @@ def _build_region_recursive(cfg: CFG, instructions: List[Instruction],
         children.append(simple_region)
 
         if block.terminator == 'fall' and block.successors:
+            # 普通顺序流，直接接到下一个块。
             current = block.successors[0]
         elif block.terminator == 'jmp' and block.successors:
             target = block.successors[0]
@@ -1087,6 +1183,8 @@ def _build_region_recursive(cfg: CFG, instructions: List[Instruction],
                     if jmp_instr.op == VM.JMP:
                         jmp_target_addr = jmp_instr.addr + jmp_instr.operands[0]
                         if jmp_target_addr >= switch_exit_addr:
+                            # switch case 末尾跳出整个 switch 时，后面生成 block 代码
+                            # 要补一个 `break;`。
                             simple_region._switch_break_exit = True
                 current = None
             else:
@@ -1111,6 +1209,7 @@ def _build_loop_region(cfg: CFG, instructions: List[Instruction],
                         loop_by_header: Dict[int, LoopInfo],
                         processed: Set[int],
                         switch_exit_addr: Optional[int] = None) -> Region:
+    """构建循环 Region，并递归处理循环体内部。"""
     header = loop_info.header
     body_blocks = loop_info.body_blocks
 
@@ -1188,6 +1287,7 @@ def _build_loop_region(cfg: CFG, instructions: List[Instruction],
     return region
 
 def _has_skip_else_jmp(cfg: CFG, else_entry: Optional[int]) -> bool:
+    """判断 else 入口前是否存在一条专门“跳过 else”的 jmp。"""
     if else_entry is None or else_entry < 0:
         return False
     else_block = cfg.get_block(else_entry)
@@ -1214,6 +1314,7 @@ def _build_if_region(cfg: CFG, instructions: List[Instruction],
                       containing_loop: Optional[LoopInfo],
                       loop_blocks: Set[int],
                       switch_exit_addr: Optional[int] = None) -> Region:
+    """从单个条件块构建普通 if / if-else Region。"""
     block = cfg.get_block(cond_block_id)
     processed.add(cond_block_id)
 
@@ -1228,6 +1329,7 @@ def _build_if_region(cfg: CFG, instructions: List[Instruction],
 
     if merge_point is None or merge_point < 0:
         if not _has_skip_else_jmp(cfg, else_entry):
+            # 没有可靠 postdom 时，很多简单 if 的 else 入口本身就是汇合点。
             merge_point = else_entry
 
     all_blocks = {cond_block_id}
@@ -1237,6 +1339,8 @@ def _build_if_region(cfg: CFG, instructions: List[Instruction],
 
     shared = then_blocks & else_blocks
     if shared and (merge_point is None or merge_point < 0):
+        # then/else 同时可达的共享块，往往提示真正 merge 点比 postdom 更靠前。
+        # 但要小心别把 switch 的公共尾巴误认成 if merge。
         real_merge = min(shared, key=lambda b: cfg.get_block(b).start_idx if cfg.get_block(b) else float('inf'))
         else_entry_block = cfg.get_block(else_entry) if else_entry is not None else None
         is_switch_shared = False
@@ -1259,6 +1363,7 @@ def _build_if_region(cfg: CFG, instructions: List[Instruction],
 
     then_region = None
     if then_entry is not None and then_entry != merge_point and then_blocks:
+        # 分支内部继续递归结构化，这样 then 里还能再识别出 loop/switch/try。
         then_processed = set(processed)
         for b in then_blocks:
             then_processed.discard(b)
@@ -1273,6 +1378,7 @@ def _build_if_region(cfg: CFG, instructions: List[Instruction],
 
     else_region = None
     if else_entry is not None and else_entry != merge_point and else_blocks:
+        # else 分支同理。
         else_processed = set(processed)
         for b in else_blocks:
             else_processed.discard(b)
@@ -1309,6 +1415,15 @@ def _build_condition_chain_if_region(cfg: CFG, instructions: List[Instruction],
                                       loop_blocks: Set[int],
                                       nf_block_ids: Optional[set] = None,
                                       switch_exit_addr: Optional[int] = None) -> Region:
+    """构造“条件链版”的 if Region。
+
+    对应源码常见形态：
+    - `if (a && b && c) ...`
+    - `if (a || b || c) ...`
+
+    这里除了普通 if 的 then/else 子区间外，还要额外记住整条 chain，
+    让生成阶段能把多个条件块重新拼成一个布尔表达式。
+    """
     if nf_block_ids is None:
         nf_block_ids = set()
 
@@ -1320,6 +1435,7 @@ def _build_condition_chain_if_region(cfg: CFG, instructions: List[Instruction],
 
     if merge_point is None or merge_point < 0:
         if not _has_skip_else_jmp(cfg, else_block):
+            # 条件链没有稳定 merge 时，也尝试回退到 else 入口作为汇合点。
             merge_point = else_block
 
     then_blocks = _collect_branch_blocks(cfg, body_block, merge_point, processed, loop_blocks)
@@ -1395,6 +1511,7 @@ def _build_condition_chain_if_region(cfg: CFG, instructions: List[Instruction],
 
 def _collect_branch_blocks(cfg: CFG, entry: Optional[int], merge_point: Optional[int],
                             processed: Set[int], loop_blocks: Set[int]) -> Set[int]:
+    """从分支入口出发，收集直到 merge 点前的所有可达块。"""
     if entry is None or entry < 0:
         return set()
     if entry == merge_point:
@@ -1431,6 +1548,13 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
                      case_blocks: List[int], default_or_end: Optional[int],
                      loop_update_addr: Optional[int] = None
                      ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """推断 switch 的真正结束地址与 default 入口。
+
+    这个函数的任务不是简单找“最后一个 case 后面的块”，而是从实际跳转模式里猜：
+    - 哪个地址才是多数 case `break` 共同跳向的位置；
+    - `default_or_end` 到底是 default 体入口，还是整个 switch 的结束点；
+    - 是否存在“先跳出 switch，再紧跟一条回跳”的双跳板结构。
+    """
     first_case_block = cfg.get_block(case_blocks[0])
     last_case_block = cfg.get_block(case_blocks[-1])
     if first_case_block is None or last_case_block is None:
@@ -1451,6 +1575,8 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
     last_case_end_addr = instructions[last_case_block.end_idx - 1].addr
     case_body_entry_addrs = set()
     for cb_id in case_blocks:
+        # `cond_true` 一般就是命中 case 后进入的主体入口，用它来排除
+        # “跳到别的 case 体”这种 fall-through/共享 body，不把它误算成 break。
         cb = cfg.get_block(cb_id)
         if cb and cb.cond_true is not None:
             entry_block = cfg.get_block(cb.cond_true)
@@ -1465,6 +1591,8 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
 
     break_targets = {}
     for bid in all_block_ids:
+        # 第一轮先统计“从 switch 区间内部跳到外部”的候选目标地址。
+        # 被更多 jmp 指向的地址，更像真实的 switch 结束点。
         b = cfg.get_block(bid)
         if b is None or b.start_idx < switch_start_idx:
             continue
@@ -1485,6 +1613,8 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
         if (default_or_end_addr is not None and
                 default_or_end_addr in break_targets and
                 any(t > default_or_end_addr for t in break_targets)):
+            # 如果 default_or_end 同时也像一个 break 目标，需要进一步排除：
+            # 它可能只是 default 起点，而不是 switch 真出口。
             exit_code_count = 0
             if scan_end_idx is not None:
                 idx = scan_end_idx - 1
@@ -1509,11 +1639,14 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
             if not is_tail_padding:
                 del break_targets[default_or_end_addr]
         exit_end_addr = max(break_targets, key=lambda t: (break_targets[t], t))
+        # 票数最高的候选目标，先视为“最像 break 汇合点”的地址。
 
         if (exit_end_addr == loop_update_addr
                 and loop_update_addr is not None
                 and default_or_end_addr is not None
                 and default_or_end_addr != loop_update_addr):
+            # switch 在循环里时，很多 break 会先跳到循环 update。
+            # 这时还要努力找一个更像“switch 自身出口”的桥接地址。
             bridge_candidates = {t: c for t, c in break_targets.items()
                                  if default_or_end_addr < t < loop_update_addr}
             if bridge_candidates:
@@ -1541,6 +1674,8 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
                         exit_end_addr = default_or_end_addr
 
         if exit_end_addr == default_or_end_addr:
+            # 如果当前出口和 default_or_end 撞在一起，就再检查一遍：
+            # 它会不会其实是 default / do-while 尾部，而真正的退出点另在别处。
             forward_count = break_targets.get(exit_end_addr, 0)
             if forward_count <= len(case_blocks):
                 backward_targets = {}
@@ -1561,6 +1696,10 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
                     exit_end_addr = max(backward_targets, key=backward_targets.get)
 
         if default_or_end_addr is not None and default_or_end_addr != exit_end_addr:
+            # 检查是否存在“双跳板”：
+            #   jmp exit_end
+            #   jmp back/default
+            # 这种模式常见于 switch 落在循环里时。
             scan_start_idx = cfg.get_block(default_or_end).start_idx if cfg.get_block(default_or_end) else last_case_block.end_idx
             for cb_id in case_blocks:
                 cb = cfg.get_block(cb_id)
@@ -1608,6 +1747,8 @@ def _find_switch_end(cfg: CFG, instructions: List[Instruction],
             scan_start_idx = dor_block.start_idx
 
     for bid in all_block_ids:
+        # 如果前面的 break 统计法没找到出口，再尝试识别“前跳 + 紧跟一条回跳”
+        # 的双跳板骨架。
         b = cfg.get_block(bid)
         if b is None or b.start_idx < scan_start_idx:
             continue
@@ -1655,6 +1796,7 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
                           containing_loop: Optional[LoopInfo],
                           loop_blocks: Set[int],
                           switch_exit_addr: Optional[int] = None) -> Region:
+    """从 switch 比较链构造 SWITCH Region。"""
     case_blocks = switch_info['case_blocks']
     ref_reg = switch_info['ref_reg']
     default_or_end = switch_info.get('default_or_end')
@@ -1687,6 +1829,8 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
     case_body_map = []
 
     for cb_id in case_blocks:
+        # 每个 case 条件块都会比较同一个 `ref_reg` 与某个 case 常量。
+        # 这里把“条件块 -> 命中时进入哪个 body -> case 值寄存器/常量槽”绑定起来。
         cb = cfg.get_block(cb_id)
         if cb is None:
             continue
@@ -1701,6 +1845,7 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
 
     body_groups = OrderedDict()
     for cb_id, body_entry, ceq_const_idx in case_body_map:
+        # 多个 case 指向同一 body 时，后续会恢复成连续的 case 标签共享一个代码块。
         if body_entry not in body_groups:
             body_groups[body_entry] = []
         body_groups[body_entry].append((cb_id, ceq_const_idx))
@@ -1754,6 +1899,10 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
         falls_through_target = None
 
         while worklist:
+            # 从某个 case body 入口向外扩张，直到分类出：
+            # - `break`        : 跳到 switch 之后
+            # - `continue`     : 跳回外围循环
+            # - fall-through   : 掉入另一个 case body
             bid = worklist.pop()
             if bid in visited or bid < 0:
                 continue
@@ -1842,6 +1991,8 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
 
         for i, (cb_id, ceq_const_idx) in enumerate(group):
             is_last_in_group = (i == len(group) - 1)
+            # 同组共享 body 的多个 case 里，只有最后一个真正附带 body_region；
+            # 前面的 case 只是标签继续下落。
             sc = SwitchCase(
                 value_expr=ceq_const_idx,
                 body_blocks=sorted(body_blocks),
@@ -1857,6 +2008,8 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
     default_shared = False
     if default_body_block is not None and default_body_addr != exit_end_addr:
         if default_body_addr in body_entry_addr_to_bid:
+            # default 与已有 case 共用 body：
+            # 例如 `default:` 直接落到某个 case 的主体逻辑。
             shared_body_bid = body_entry_addr_to_bid[default_body_addr]
             for i, sc in enumerate(switch_cases):
                 if shared_body_bid in sc.body_blocks:
@@ -1882,6 +2035,7 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
                         backward_default_continue = True
 
             if backward_default_continue:
+                # default 直接回到循环头，恢复成 `default: continue;` 更自然。
                 switch_cases.append(SwitchCase(
                     value_expr=None,
                     body_blocks=[],
@@ -1897,6 +2051,7 @@ def _build_switch_region(cfg: CFG, instructions: List[Instruction],
                 default_has_break = False
 
                 while worklist:
+                    # default body 的遍历规则与普通 case 基本相同，只是没有 case 值。
                     bid = worklist.pop()
                     if bid in visited or bid < 0:
                         continue
@@ -1981,6 +2136,7 @@ def _build_try_region(cfg: CFG, instructions: List[Instruction],
                        containing_loop: Optional[LoopInfo],
                        loop_blocks: Set[int],
                        switch_exit_addr: Optional[int] = None) -> Region:
+    """构造 TRY_CATCH Region。"""
     entry_block_id = try_info['entry_block']
     try_body_start = try_info['try_body_start']
     catch_block_id = try_info['catch_block']
@@ -2002,6 +2158,12 @@ def _build_try_region(cfg: CFG, instructions: List[Instruction],
             extry_idx = idx
 
     if extry_idx is not None:
+        # 常见 try 形态是：
+        #   ENTRY catch
+        #   ... try body ...
+        #   EXTRY
+        #   JMP after_catch
+        # 这里优先把这条“跳过 catch”的 jmp 认作 try 的正常出口。
         for idx in range(extry_idx + 1, catch_start_idx):
             if instructions[idx].op == VM.JMP:
                 jmp_target_addr = instructions[idx].addr + instructions[idx].operands[0]
@@ -2019,6 +2181,7 @@ def _build_try_region(cfg: CFG, instructions: List[Instruction],
         processed.add(exit_block)
     try_blocks = set()
     if try_body_start is not None:
+        # try 主体从 ENTRY 后第一块开始，一直收集到 catch 起点前。
         try_blocks = _collect_branch_blocks(
             cfg, try_body_start, catch_block_id, processed, loop_blocks
         )
@@ -2031,6 +2194,7 @@ def _build_try_region(cfg: CFG, instructions: List[Instruction],
     catch_blocks = _collect_branch_blocks(
         cfg, catch_block_id, exit_block, processed, loop_blocks
     )
+    # catch 则一直收到统一出口前。
     all_blocks.update(catch_blocks)
     for b in catch_blocks:
         processed.add(b)
@@ -2072,6 +2236,10 @@ def generate_code(region: Region, cfg: CFG, instructions: List[Instruction],
                   decompiler: 'Decompiler', obj: CodeObject,
                   loop_context: Optional[Tuple[int, int, int]] = None,
                   is_top_level: bool = False) -> List[Stmt]:
+    """把 Region 树重新生成为语句 AST。
+
+    可以把它理解为一层“Region -> AST”的分发表。
+    """
     if region.type == RegionType.BLOCK:
         if (decompiler._for_loop_skip_tail_bid is not None
                 and region.header_block == decompiler._for_loop_skip_tail_bid):
@@ -2099,6 +2267,7 @@ def generate_code(region: Region, cfg: CFG, instructions: List[Instruction],
 def _generate_sc_expr(region: Region, cfg: CFG, instructions: List[Instruction],
                       decompiler: 'Decompiler', obj: CodeObject,
                       loop_context: Optional[Tuple[int, int, int]]) -> List[Stmt]:
+    """把短路 Region 恢复成表达式，并写回目标寄存器。"""
     header_block = cfg.get_block(region.header_block)
     if header_block is None:
         return []
@@ -2121,6 +2290,7 @@ def _generate_sc_expr(region: Region, cfg: CFG, instructions: List[Instruction],
             break
 
     if setf_block_id is None:
+        # 找不到 SETF/SETNF 时，退回普通线性代码生成，优先保证语义。
         return decompiler._generate_structured_code(
             instructions, obj, header_block.start_idx, sc_end_idx,
             loop_context=loop_context)
@@ -2144,6 +2314,7 @@ def _generate_sc_expr(region: Region, cfg: CFG, instructions: List[Instruction],
         cfg, instructions, decompiler, obj, region.blocks, chain_stmts)
 
     if is_setnf:
+        # `SETNF` 可理解为“把最终条件结果取反后落入寄存器”。
         expr = decompiler._negate_expr(expr)
 
     decompiler.regs[setf_reg] = expr
@@ -2153,6 +2324,7 @@ def _generate_sc_expr(region: Region, cfg: CFG, instructions: List[Instruction],
 def _find_sc_chain_entry(header: int, setf_block_id: int, cfg: CFG,
                           instructions: List[Instruction],
                           region_blocks: Set[int]) -> int:
+    """寻找短路链的真正起点。"""
     current = header
     visited = set()
 
@@ -2206,6 +2378,7 @@ def _find_sc_chain_entry(header: int, setf_block_id: int, cfg: CFG,
 def _sc_body_has_side_effects(start_bid: int, end_bid: int, cfg: CFG,
                                instructions: List[Instruction],
                                region_blocks: Set[int]) -> bool:
+    """判断短路分支体中是否含有不宜内联进表达式的副作用。"""
     current = start_bid
     visited = set()
     while current is not None and current != end_bid and current not in visited:
@@ -2236,6 +2409,12 @@ def _build_sc_chain_expr(block_id: int, boundary_id: int, setf_block_id: int,
                           decompiler: 'Decompiler', obj: CodeObject,
                           region_blocks: Set[int],
                           chain_stmts: List[Stmt]) -> Expr:
+    """递归构造短路表达式树。
+
+    这里会在 `&&` / `||` 和 `?:` 之间切换：
+    - 普通短路链会恢复为 `BinaryExpr`
+    - 某些菱形分支会恢复为 `TernaryExpr`
+    """
     if block_id == boundary_id or block_id == setf_block_id:
         return decompiler._get_condition(False)
 
@@ -2361,6 +2540,7 @@ def _build_sc_chain_expr(block_id: int, boundary_id: int, setf_block_id: int,
 def _find_sc_ternary_merge(true_entry: int, false_entry: int,
                             setf_block_id: int, boundary_id: int,
                             cfg: CFG, region_blocks: Set[int]) -> Optional[int]:
+    """为短路表达式中的菱形分支寻找可恢复成 `?:` 的 merge 点。"""
     current = true_entry
     visited = set()
     while current is not None and current not in visited:
@@ -2387,6 +2567,7 @@ def _find_sc_ternary_merge(true_entry: int, false_entry: int,
 
 def _sc_reaches(start_bid: int, target_bid: int, cfg: CFG,
                  region_blocks: Set[int]) -> bool:
+    """判断短路子图里一条线性路径是否能到达指定目标块。"""
     current = start_bid
     visited = set()
     while current is not None and current not in visited:
@@ -2409,6 +2590,7 @@ def _sc_reaches(start_bid: int, target_bid: int, cfg: CFG,
 def _find_sc_subgroup_exit_op(start_bid: int, boundary_bid: int,
                                setf_block_id: int, cfg: CFG,
                                region_blocks: Set[int]) -> Optional[str]:
+    """推断短路子组离开时与外层相连的逻辑运算符。"""
     current = start_bid
     visited = set()
     exit_op = None
@@ -2442,6 +2624,7 @@ def _find_sc_subgroup_exit_op(start_bid: int, boundary_bid: int,
 def _process_sc_ternary_branch(entry_bid: int, merge_bid: int,
                                 cfg: CFG, instructions: List[Instruction],
                                 decompiler: 'Decompiler', obj: CodeObject) -> Tuple[Expr, Optional[int]]:
+    """分析短路三元分支的一侧，提取表达式结果与可能的目标寄存器。"""
     saved_regs = dict(decompiler.regs)
     saved_flag = decompiler.flag
     saved_flag_negated = decompiler.flag_negated
@@ -2491,6 +2674,7 @@ def _process_sc_ternary_branch(entry_bid: int, merge_bid: int,
 def _generate_block(region: Region, cfg: CFG, instructions: List[Instruction],
                      decompiler: 'Decompiler', obj: CodeObject,
                      loop_context: Optional[Tuple[int, int, int]]) -> List[Stmt]:
+    """把单个基本块翻译成语句列表。"""
     block = cfg.get_block(region.header_block)
     if block is None:
         return []
@@ -2510,6 +2694,7 @@ def _generate_block(region: Region, cfg: CFG, instructions: List[Instruction],
         instr = instructions[i]
 
         if instr.op in (VM.JF, VM.JNF, VM.EXTRY):
+            # 这些控制流指令已经在 Region/CFG 层面消费掉了，块内无需再次翻译。
             i += 1
             continue
 
@@ -2518,6 +2703,7 @@ def _generate_block(region: Region, cfg: CFG, instructions: List[Instruction],
             if loop_context:
                 loop_start_addr, loop_exit_addr, continue_target = loop_context
                 if target == continue_target:
+                    # 循环内跳到“继续点”，恢复成 continue。
                     flushed = decompiler._flush_pending_spie()
                     if flushed:
                         stmts.append(flushed)
@@ -2527,6 +2713,7 @@ def _generate_block(region: Region, cfg: CFG, instructions: List[Instruction],
                     i += 1
                     continue
                 elif target >= loop_exit_addr:
+                    # 跳出当前循环范围，恢复成 break。
                     flushed = decompiler._flush_pending_spie()
                     if flushed:
                         stmts.append(flushed)
@@ -2572,6 +2759,7 @@ def _generate_block(region: Region, cfg: CFG, instructions: List[Instruction],
     return stmts
 
 def _generate_block_for_update(block, instructions, decompiler, obj):
+    """把循环尾块翻译成 `for (...; ...; update)` 中的 update 部分。"""
     stmts = []
     i = block.start_idx
     while i < block.end_idx:
@@ -2598,6 +2786,7 @@ def _generate_block_for_update(block, instructions, decompiler, obj):
 def _generate_sequence(region: Region, cfg: CFG, instructions: List[Instruction],
                         decompiler: 'Decompiler', obj: CodeObject,
                         loop_context: Optional[Tuple[int, int, int]]) -> List[Stmt]:
+    """顺序拼接多个子 Region 生成的语句。"""
     stmts = []
     for child in region.children:
         child_stmts = generate_code(child, cfg, instructions, decompiler, obj, loop_context)
@@ -2608,6 +2797,18 @@ def _generate_sequence(region: Region, cfg: CFG, instructions: List[Instruction]
     return stmts
 
 def _absorb_for_init(stmts: List[Stmt]) -> None:
+    """把 `for` 前一条初始化语句吸收到 `for(init; cond; update)` 里。
+
+    例如先生成：
+    ```tjs
+    var i = 0;
+    for (; i < 10; i++) { ... }
+    ```
+    会尽量再压缩回：
+    ```tjs
+    for (var i = 0; i < 10; i++) { ... }
+    ```
+    """
     import re
     i = 1
     while i < len(stmts):
@@ -2637,6 +2838,7 @@ def _absorb_for_init(stmts: List[Stmt]) -> None:
         i += 1
 
 def _get_var_name_from_expr(expr) -> Optional[str]:
+    """从变量或赋值表达式中提取左值变量名。"""
     if isinstance(expr, VarExpr):
         return expr.name
     if isinstance(expr, AssignExpr):
@@ -2644,6 +2846,7 @@ def _get_var_name_from_expr(expr) -> Optional[str]:
     return None
 
 def _expr_contains_var(expr, var_name: str) -> bool:
+    """判断表达式树中是否引用了给定变量名。"""
     if expr is None:
         return False
     if isinstance(expr, VarExpr):
@@ -2665,6 +2868,7 @@ def _expr_contains_var(expr, var_name: str) -> bool:
     return False
 
 def _is_matching_for_init(prev_stmt: Stmt, for_stmt: ForStmt) -> bool:
+    """判断一条前置语句是否适合并入 for 的 init 段。"""
     if isinstance(prev_stmt, VarDeclStmt):
         var_name = prev_stmt.name
     elif isinstance(prev_stmt, ExprStmt) and isinstance(prev_stmt.expr, AssignExpr):
@@ -2684,6 +2888,16 @@ def _process_condition_block_preamble(
     instructions: List[Instruction], decompiler: 'Decompiler', obj: CodeObject,
     start_idx: int, end_idx: int, clear_regs: bool = False
 ) -> Tuple[List[Stmt], Expr, Set[int], List[Tuple[int, int, 'Stmt']]]:
+    """处理条件块中“真正跳转前”的前导指令。
+
+    条件判断块里并不总是只有 `JF/JNF`。编译器常把如下内容放在前面：
+    - 比较结果写入寄存器
+    - 前置自增/自减
+    - 临时变量赋值
+
+    这个函数会尽量把可嵌入条件表达式的内容抽出来；不能安全内联的，则保留
+    为 preamble 语句，确保语义不变。
+    """
     if clear_regs:
         decompiler.regs.clear()
 
@@ -2718,6 +2932,8 @@ def _process_condition_block_preamble(
         if (instr.op == VM.CP and len(instr.operands) >= 2
                 and instr.operands[0] >= 0 and instr.operands[1] < -2
                 and pi > start_idx and pi + 1 < preamble_end_idx):
+            # 这里专门识别“local <-> temp”搬运后立刻做 typeof/isvalid 的模式，
+            # 避免把条件内部的必要中转寄存器错误提前输出成独立语句。
             prev = instructions[pi - 1]
             next_instr = instructions[pi + 1]
             if (prev.op == VM.CP and len(prev.operands) >= 2
@@ -2739,17 +2955,20 @@ def _process_condition_block_preamble(
                     continue
         swap_result = decompiler._try_detect_swap(instructions, obj, pi, preamble_end_idx)
         if swap_result:
+            # 条件前导里也可能夹着交换逻辑，优先恢复成更高层语法。
             preamble_stmts.append(swap_result['stmt'])
             pi = swap_result['next_idx']
             continue
         stmt = decompiler._translate_instruction(instr, obj)
         decompiler._collect_pre_stmts(preamble_stmts)
         if stmt:
+            # 不能并入条件表达式的副作用，就保留在前导语句序列中。
             preamble_stmts.append(stmt)
         pi += 1
 
     flushed = decompiler._flush_pending_spie()
     if flushed:
+        # 延迟提交的属性写入等语句必须先落地，再读取最终条件。
         preamble_stmts.append(flushed)
 
     cond = decompiler._get_condition(False)
@@ -2759,6 +2978,7 @@ def _process_condition_block_preamble(
 def _emit_unmerged_side_effects(preamble_stmts: List[Stmt],
                                  deferred_side_effects: List[Tuple[int, int, 'Stmt']],
                                  merged_addrs: Set[int]) -> None:
+    """把未成功并入条件表达式的副作用语句重新插回前导列表。"""
     offset = 0
     for pos, addr, stmt in deferred_side_effects:
         if addr not in merged_addrs:
@@ -2767,6 +2987,7 @@ def _emit_unmerged_side_effects(preamble_stmts: List[Stmt],
 
 def _embed_assign_in_expr_tree(expr: Expr, target_value: Expr,
                                 assign_expr: 'AssignExpr') -> bool:
+    """按对象身份把赋值表达式嵌入现有表达式树。"""
     if isinstance(expr, BinaryExpr):
         if expr.left is target_value:
             expr.left = assign_expr
@@ -2852,6 +3073,7 @@ def _embed_assign_in_expr_tree(expr: Expr, target_value: Expr,
 
 def _embed_assign_by_var_name(expr: Expr, var_name: str,
                                assign_expr: 'AssignExpr') -> bool:
+    """按变量名匹配，把赋值表达式嵌回表达式树。"""
     if isinstance(expr, BinaryExpr):
         if isinstance(expr.left, VarExpr) and expr.left.name == var_name:
             expr.left = assign_expr
@@ -2902,6 +3124,7 @@ def _embed_assign_by_var_name(expr: Expr, var_name: str,
 
 def _detect_assignment_in_condition(preamble_stmts: List[Stmt], cond: Expr,
                                      preamble_start_count: int = 0) -> Expr:
+    """尝试把条件前导中的末尾赋值提升进条件表达式本身。"""
     if len(preamble_stmts) > preamble_start_count:
         last_stmt = preamble_stmts[-1]
         assign_expr = None
@@ -2932,12 +3155,14 @@ def _detect_assignment_in_condition(preamble_stmts: List[Stmt], cond: Expr,
     return cond
 
 def _strip_embedded_assigns_from_regs(regs: dict) -> None:
+    """从寄存器缓存中剥离已内联到条件里的赋值表达式。"""
     for r in list(regs.keys()):
         cleaned = _strip_assign_from_expr(regs[r])
         if cleaned is not regs[r]:
             regs[r] = cleaned
 
 def _strip_assign_from_expr(expr: Expr) -> Expr:
+    """递归删除表达式树中的赋值节点，只保留其右值结构。"""
     if isinstance(expr, AssignExpr):
         return expr.target
     if isinstance(expr, TypeofExpr):
@@ -2986,8 +3211,10 @@ def _strip_assign_from_expr(expr: Expr) -> Expr:
 def _generate_if(region: Region, cfg: CFG, instructions: List[Instruction],
                   decompiler: 'Decompiler', obj: CodeObject,
                   loop_context: Optional[Tuple[int, int, int]]) -> List[Stmt]:
+    """把 IF Region 重新生成为 IfStmt。"""
     chain_blocks = getattr(region, '_condition_chain', None)
     if chain_blocks is not None:
+        # 多块条件链交给专门逻辑处理，否则很难恢复成一个完整布尔表达式。
         return _generate_compound_condition_if(
             region, cfg, instructions, decompiler, obj, loop_context
         )
@@ -3013,6 +3240,7 @@ def _generate_if(region: Region, cfg: CFG, instructions: List[Instruction],
     _emit_unmerged_side_effects(preamble_stmts, deferred_se, merged_addrs)
 
     if region.type == RegionType.IF_THEN_ELSE and region.then_region and region.else_region:
+        # if 两边如果都只是产出一个值，有机会进一步压缩成三元表达式。
         ternary_result = _try_ternary_from_regions(
             region, cfg, instructions, decompiler, obj, if_cond
         )
@@ -3026,6 +3254,7 @@ def _generate_if(region: Region, cfg: CFG, instructions: List[Instruction],
     then_stmts = []
     then_regs = saved_regs
     if region.then_region:
+        # then/else 分支要从同一份入口寄存器状态各自独立生成。
         decompiler.regs = dict(saved_regs)
         decompiler.flag = saved_flag
         decompiler.flag_negated = saved_flag_negated
@@ -3048,6 +3277,7 @@ def _generate_if(region: Region, cfg: CFG, instructions: List[Instruction],
     if region.type == RegionType.IF_THEN_ELSE:
         for reg in set(then_regs) | set(else_regs):
             if reg > 0 and reg not in saved_regs:
+                # 两边都给同一正寄存器留下值时，保守地把它合并回当前状态。
                 then_val = then_regs.get(reg)
                 else_val = else_regs.get(reg)
                 if then_val is not None and else_val is not None:
@@ -3070,6 +3300,7 @@ def _generate_if(region: Region, cfg: CFG, instructions: List[Instruction],
             return False
 
         if not then_stmts and not else_stmts and region.type == RegionType.IF_THEN:
+            # switch case 中的空分支有时其实隐含了一个 break。
             if _check_region_exit_is_switch_break(region.then_region):
                 false_exits_switch = False
                 cond_blk = cfg.get_block(region.cond_block)
@@ -3178,6 +3409,7 @@ def _generate_if(region: Region, cfg: CFG, instructions: List[Instruction],
                     then_stmts = [ReturnStmt(VoidExpr())]
 
     if not then_stmts and else_stmts:
+        # 输出时尽量偏向“then 有内容、else 可选”的自然形态。
         if_cond = decompiler._negate_expr(if_cond)
         then_stmts, else_stmts = else_stmts, then_stmts
 
@@ -3186,6 +3418,7 @@ def _generate_if(region: Region, cfg: CFG, instructions: List[Instruction],
 
     if (loop_context and not else_stmts and then_stmts
             and isinstance(then_stmts[-1], BreakStmt)):
+        # 某些循环里的 if 实际是“条件不满足时直接 break”，这里做轻量整理。
         last_instr = instructions[block.end_idx - 1]
         if last_instr.op in (VM.JF, VM.JNF):
             false_branch_addr = last_instr.addr + last_instr.operands[0]
@@ -3208,6 +3441,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                                      decompiler: 'Decompiler', obj: CodeObject,
                                      loop_context: Optional[Tuple[int, int, int]],
                                      return_condition_only: bool = False):
+    """生成“条件链版” if，或仅返回其拼好的条件表达式。"""
     chain_blocks_full = region._condition_chain
     body_block = region._chain_body_block
     else_block = region._chain_else_block
@@ -3259,6 +3493,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         conditions.append(cond)
 
     for nf_id in nf_set:
+        # NF 块通常只是对 flag 做翻转/中转，这里把它的副作用先吸收进 decompiler 状态。
         nf_blk = cfg.get_block(nf_id)
         if nf_blk:
             for instr in instructions[nf_blk.start_idx:nf_blk.end_idx]:
@@ -3274,6 +3509,16 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
     _FALL = 'FALL'
 
     def _classify_jump(bid):
+        # 把每个条件块的控制流归类成：
+        # - `_BODY`   : 这条边最终走向 if 主体
+        # - `_ELSE`   : 这条边最终走向 else / 失败出口
+        # - `_CHAIN`  : 继续跳到下一条件块
+        # - `_NF`     : 先进入 NF 中转块再决定去向
+        # - `_FALL`   : 直接顺序落空
+        # - `_FALL_NF`: 顺序落空后先进入 NF 中转块
+        #
+        # 这一步是整个 compound-if 重建的基础，因为后面重建 `&&` / `||`
+        # 其实并不是看 opcode 名字，而是看“当前条件成立/失败时控制流想去哪里”。
         blk = cfg.get_block(bid)
         if blk.terminator == 'fall':
             if blk.successors:
@@ -3298,6 +3543,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         return (_ELSE, jump)
 
     def _resolve_nf(block_terminator, nf_id):
+        # NF 块相当于对 flag 做一次翻转/中转，因此不能只看 NF 自己的 terminator，
+        # 还必须结合“进入 NF 的原块是 jf 还是 jnf”一起解释最终语义。
         nf_blk = cfg.get_block(nf_id)
         if nf_blk is None:
             return else_block
@@ -3314,6 +3561,12 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
 
     def _get_effective_cond(idx, subgroup_context=None, in_structural_not=False,
                             subgroup_end=None):
+        # 这里的核心工作是：决定“当前块里提取出的条件表达式”是否需要取反。
+        #
+        # 注意：
+        # 字节码里的 `jf/jnf`、NF 中转块、子链边界，并不一一对应源码里的
+        # `!cond`。因此这里要根据控制流去向来倒推出：
+        # “为了让这段条件在高层语义上表示‘通往 BODY 的判定’，它应不应该取反？”
         bid = chain_blocks[idx]
         blk = cfg.get_block(bid)
         cond = conditions[idx]
@@ -3322,12 +3575,15 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         if cls == _CHAIN and subgroup_end is not None and raw_target in chain_pos:
             target_p = chain_pos[raw_target]
             if target_p > subgroup_end:
+                # 当前块虽然跳向的是 chain，但已经越过了本子组边界，
+                # 这时它更像对子组整体做门控，不应简单按普通 chain 规则取反。
                 is_jf = (blk.terminator == 'jf')
                 if (subgroup_context == 'and' and is_jf) or \
                    (subgroup_context == 'or' and not is_jf):
                     return cond
 
         if cls == _FALL_NF:
+            # 顺序落空后再进 NF，通常意味着“先翻一次，再看后续是否进 body/else”。
             effective = _resolve_nf('jf', raw_target)
             if effective in chain_set:
                 if subgroup_context == 'and':
@@ -3343,6 +3599,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                     is_to_body = (effective == body_block or effective == resolved_body)
                     should_negate = not is_to_body
         elif cls == _CHAIN:
+            # 仍在条件链内部时，是否取反取决于我们当前是在重建 AND 子组还是 OR 子组。
             is_jf = (blk.terminator == 'jf')
             if subgroup_context == 'and':
                 should_negate = is_jf
@@ -3351,6 +3608,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
             else:
                 should_negate = False
         elif cls == _NF:
+            # 显式跳进 NF 中转块，需要先解析 NF 真正通向哪里，再决定正负。
             effective = _resolve_nf(blk.terminator, raw_target)
             if effective in chain_set:
                 is_jf = (blk.terminator == 'jf')
@@ -3365,6 +3623,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                 is_to_body = (effective == body_block)
                 should_negate = (is_jf != is_to_body)
         elif cls in (_BODY, _ELSE):
+            # 直接出链的块最简单：判断“当前 terminator 对应的分支”是不是 body。
             is_jf = (blk.terminator == 'jf')
             is_to_body = (cls == _BODY)
             should_negate = (is_jf != is_to_body)
@@ -3376,6 +3635,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         return cond
 
     def _get_effective_jump(idx):
+        # 与 `_get_effective_cond()` 对应，这里返回“当前条件块在高层语义上
+        # 下一步会流向哪里”，供子链重建与 subgroup 类型判断使用。
         bid = chain_blocks[idx]
         cls, raw_target = _classify_jump(bid)
         if cls == _NF:
@@ -3391,6 +3652,10 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         return else_block
 
     def _trace_to_exit(target, visited):
+        # 从某个 chain 目标一路追到最终出口：
+        # True  表示最终偏向 BODY
+        # False 表示最终偏向 ELSE
+        # 这个追踪结果会影响“某段子链更像 AND 组还是 OR 组”。
         if target is None:
             return True
         if target == body_block or target == resolved_body:
@@ -3409,6 +3674,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         return True
 
     def _is_structural_not_subgroup(start, target_pos):
+        # 某些子链的整体更像 `!(...)`，而不是单纯的 AND / OR 平铺。
+        # 这里通过起点是否先落到 NF，再观察 NF 的出口方向来识别这种“结构性取反”。
         start_bid = chain_blocks[start]
         start_cls, start_raw = _classify_jump(start_bid)
         if start_cls not in (_NF, _FALL_NF):
@@ -3438,6 +3705,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         return False
 
     def _determine_subgroup_type(start, target_pos):
+        # 返回 True  表示该子组更像 AND 组
+        # 返回 False 表示该子组更像 OR 组
         boundary_idx = target_pos - 1
         if boundary_idx < start:
             return True
@@ -3445,6 +3714,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
         return _trace_to_exit(boundary_target, set())
 
     def _reconstruct(start, end):
+        # 总重建器：从 [start, end) 这段条件块中恢复一棵布尔表达式树。
         if start >= end:
             return ConstExpr(True)
         if start == end - 1:
@@ -3478,6 +3748,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                     if sj is not None and sj in chain_pos:
                         sp = chain_pos[sj]
                         if target_pos < sp < end:
+                            # 如果子组内部还有块跳向更远的位置，就把子组边界向后扩，
+                            # 避免把一个逻辑子表达式拆断。
                             target_pos = sp
                             expanded = True
                             break
@@ -3485,6 +3757,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
             structural_not = _is_structural_not_subgroup(start, target_pos)
             use_and_subgroup = _determine_subgroup_type(start, target_pos)
             if structural_not:
+                # 整个子组先重建，再整体包一层 `!`。
                 if use_and_subgroup:
                     inner = _reconstruct_and_subgroup(start, target_pos, _sn=True)
                 else:
@@ -3493,10 +3766,12 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                 rest = _reconstruct(target_pos, end)
                 return BinaryExpr(inner, '&&' if use_and_subgroup else '||', rest)
             elif use_and_subgroup:
+                # 子组整体更像“若任一失败就出链”，对应 OR 连接外层。
                 inner = _reconstruct_and_subgroup(start, target_pos)
                 rest = _reconstruct(target_pos, end)
                 return BinaryExpr(inner, '||', rest)
             else:
+                # 子组整体更像“若任一成功就出链”，对应 AND 连接外层。
                 inner = _reconstruct_or_subgroup(start, target_pos)
                 rest = _reconstruct(target_pos, end)
                 return BinaryExpr(inner, '&&', rest)
@@ -3505,6 +3780,12 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
             return BinaryExpr(_get_effective_cond(start), '&&', rest)
 
     def _reconstruct_and_subgroup(start, end, parent_context=None, _sn=False):
+        # 重建“更像 AND 的子组”。
+        #
+        # 这里的“AND”不是说最终一定会直接输出成 `a && b && c`，
+        # 而是说这段子链在 CFG 上更像“某个条件失败就提前转走”的结构。
+        # 因为控制流与源码逻辑互为对偶，所以递归展开时，局部连接符有时会出现
+        # `||`，这是正常现象，不是写反了。
         if start >= end:
             return ConstExpr(True)
         if start == end - 1:
@@ -3520,6 +3801,9 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                 structural_not = _is_structural_not_subgroup(start, target_pos)
                 use_and_inner = _determine_subgroup_type(start, target_pos)
                 if structural_not:
+                    # 例子：
+                    #   if (!(a || b) && c) ...
+                    # 某段子组可能整体先重建成 `(a || b)`，再整体包一层 `!`。
                     if use_and_inner:
                         inner = _reconstruct_and_subgroup(start, target_pos, _sn=True)
                     else:
@@ -3528,19 +3812,30 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                     rest = _reconstruct_and_subgroup(target_pos, end, parent_context, _sn=_sn)
                     return BinaryExpr(inner, '&&' if use_and_inner else '||', rest)
                 elif use_and_inner:
+                    # AND 子组内部再嵌一个 AND 风格子组，外层连接符可能反而是 `||`，
+                    # 这是 CFG 跳转方向与源码逻辑对偶关系造成的。
                     inner = _reconstruct_and_subgroup(start, target_pos, _sn=_sn)
                     rest = _reconstruct_and_subgroup(target_pos, end, parent_context, _sn=_sn)
                     return BinaryExpr(inner, '||', rest)
                 else:
+                    # 当前大组偏 AND，但内部某个子段更像 OR：
+                    # 例如 `a && (b || c) && d`
                     inner = _reconstruct_or_subgroup(start, target_pos, 'and', _sn=_sn)
                     rest = _reconstruct_and_subgroup(target_pos, end, parent_context, _sn=_sn)
                     return BinaryExpr(inner, '&&', rest)
 
+        # 没有特殊跳跃结构时，按线性“当前条件 && 剩余条件”拼接。
         rest = _reconstruct_and_subgroup(start + 1, end, parent_context, _sn=_sn)
         return BinaryExpr(_get_effective_cond(start, 'and', in_structural_not=_sn,
                                               subgroup_end=end), '&&', rest)
 
     def _reconstruct_or_subgroup(start, end, parent_context=None, _sn=False):
+        # 重建“更像 OR 的子组”。
+        #
+        # 与 AND 子组对应，这里表示这段子链更像“某个条件成功就提前转走”。
+        # 典型源码例子：
+        #   if (a || b || c) ...
+        #   if ((a && b) || c) ...
         if start >= end:
             return ConstExpr(True)
         if start == end - 1:
@@ -3556,6 +3851,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                 structural_not = _is_structural_not_subgroup(start, target_pos)
                 use_and_inner = _determine_subgroup_type(start, target_pos)
                 if structural_not:
+                    # 例子：
+                    #   if (!(a && b) || c) ...
                     if use_and_inner:
                         inner = _reconstruct_and_subgroup(start, target_pos, _sn=True)
                     else:
@@ -3564,19 +3861,29 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                     rest = _reconstruct_or_subgroup(target_pos, end, parent_context, _sn=_sn)
                     return BinaryExpr(inner, '&&' if use_and_inner else '||', rest)
                 elif use_and_inner:
+                    # 当前大组偏 OR，但内层这个跳跃子段更像 AND：
+                    # 例如 `(a && b) || c`
                     inner = _reconstruct_and_subgroup(start, target_pos, _sn=_sn)
                     rest = _reconstruct_or_subgroup(target_pos, end, parent_context, _sn=_sn)
                     return BinaryExpr(inner, '||', rest)
                 else:
+                    # 内外都偏 OR 时，剩余部分继续按 OR 子组递归。
                     inner = _reconstruct_or_subgroup(start, target_pos, _sn=_sn)
                     rest = _reconstruct_or_subgroup(target_pos, end, parent_context, _sn=_sn)
                     return BinaryExpr(inner, '&&', rest)
 
+        # 没有特殊跳跃结构时，按线性“当前条件 || 剩余条件”拼接。
         rest = _reconstruct_or_subgroup(start + 1, end, parent_context, _sn=_sn)
         return BinaryExpr(_get_effective_cond(start, 'or', in_structural_not=_sn,
                                               subgroup_end=end), '||', rest)
 
     def _split_or_groups():
+        # 把整条条件链先粗分成若干“顶层 OR 组”。
+        #
+        # 这么做的原因是：有些很长的链虽然整体仍属于一个 compound-if，
+        # 但顶层结构更像：
+        #   (group1) || (group2) || (group3)
+        # 先做这层切分，后面重建出的表达式会稳定很多。
         if n <= 1:
             return [(0, n)]
 
@@ -3587,6 +3894,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                 jump_positions[i] = chain_pos[ej]
 
         def _is_or_success_at(idx):
+            # 判断某个位置是否像“OR 成功出口”：
+            # 即条件成立后就能直接流向 BODY。
             ej = _get_effective_jump(idx)
             if ej == body_block:
                 return True
@@ -3608,6 +3917,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                 max_chain_target = ct
 
             if max_chain_target <= i + 1 and _is_or_success_at(i):
+                # 当所有跨组跳跃都已闭合，且当前位置本身像 OR 成功点时，
+                # 就可以把这里当作一个顶层 OR 分组边界。
                 all_valid = True
                 for q in range(group_start, i):
                     if _is_or_success_at(q):
@@ -3648,6 +3959,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
     else:
         group_exprs = []
         for g_start, g_end in or_groups:
+            # 每个顶层 OR 组内部再递归重建自己的局部布尔结构。
             if g_start == g_end - 1:
                 group_exprs.append(_get_effective_cond(g_start))
             else:
@@ -3661,12 +3973,14 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                     group_exprs.append(_reconstruct_and_subgroup(g_start, g_end))
         compound_cond = group_exprs[0]
         for expr in group_exprs[1:]:
+            # 顶层分组之间统一用 `||` 连接。
             compound_cond = BinaryExpr(compound_cond, '||', expr)
 
     if return_condition_only:
         return (compound_cond, preamble_stmts)
 
     if region.type == RegionType.IF_THEN_ELSE and region.then_region and region.else_region:
+        # 条件链版 if 同样有机会进一步压成三元表达式。
         ternary_result = _try_ternary_from_regions(
             region, cfg, instructions, decompiler, obj, compound_cond
         )
@@ -3680,6 +3994,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
     then_stmts = []
     then_regs = saved_regs
     if region.then_region:
+        # then/else 仍然要在同一入口状态上分别生成，逻辑与普通 if 完全一致。
         decompiler.regs = dict(saved_regs)
         decompiler.flag = saved_flag
         decompiler.flag_negated = saved_flag_negated
@@ -3702,6 +4017,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
     if region.type == RegionType.IF_THEN_ELSE:
         for reg in set(then_regs) | set(else_regs):
             if reg > 0 and reg not in saved_regs:
+                # 如果条件两侧都给同一寄存器留下了结果，就把该寄存器继续视为可用。
                 then_val = then_regs.get(reg)
                 else_val = else_regs.get(reg)
                 if then_val is not None and else_val is not None:
@@ -3724,6 +4040,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
             return False
 
         if then_stmts and not else_stmts:
+            # compound-if 落在 switch case 中时，也可能隐含一个“真分支后跳出 switch”。
             if _check_region_exit_is_switch_break_cc(region.then_region):
                 false_exits_switch = False
                 eb = cfg.get_block(else_block)
@@ -3744,6 +4061,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                         then_stmts.append(BreakStmt())
 
         if not then_stmts and not else_stmts:
+            # 极端情况下，空 then/else 也可能只是一个隐藏 break。
             if _check_region_exit_is_switch_break_cc(region.then_region):
                 false_exits_switch = False
                 eb = cfg.get_block(else_block)
@@ -3755,6 +4073,8 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                     then_stmts = [BreakStmt()]
 
         if not then_stmts and else_stmts:
+            # 只有 else 有内容时，为了输出自然，前面会在普通 if 中做翻转；
+            # compound-if 这里则用“then 补 break”方式兜底 switch 特殊形态。
             if _check_region_exit_is_switch_break_cc(region.then_region):
                 then_stmts = [BreakStmt()]
 
@@ -3764,9 +4084,14 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
 
     if_stmt = IfStmt(compound_cond, then_stmts, else_stmts)
     result = preamble_stmts + [if_stmt]
+    # 最终输出形式大致是：
+    #   <preamble side effects>
+    #   if (<compound_cond>) { ... } else { ... }
 
     if (loop_context and not else_stmts and then_stmts
             and isinstance(then_stmts[-1], BreakStmt)):
+        # 若 false 分支自然通向 loop exit，则把 break 从 if 内移到 if 后面，
+        # 让结构更贴近人类常写的“if (cond) ...; break;”风格。
         eb = cfg.get_block(else_block)
         if eb is not None:
             false_branch_addr = instructions[eb.start_idx].addr
@@ -3776,6 +4101,7 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
                 result.append(break_stmt)
 
     if loop_context and not else_stmts:
+        # false 分支若正好通向 continue 目标，则在 if 后显式补一个 continue。
         eb = cfg.get_block(else_block)
         if eb is not None:
             false_branch_addr = instructions[eb.start_idx].addr
@@ -3788,6 +4114,14 @@ def _generate_compound_condition_if(region, cfg: CFG, instructions: List[Instruc
 def _try_ternary_from_regions(region: Region, cfg: CFG, instructions: List[Instruction],
                                decompiler: 'Decompiler', obj: CodeObject,
                                condition: Expr) -> Optional[List[Stmt]]:
+    """尝试把 if/else 两个分支压缩成三元表达式链。
+
+    这里有两条主要路径：
+    1. 寄存器目标型：then/else 最终都在给同一个目标寄存器产出值；
+    2. flag 型：then/else 不产出显式语句，只是在各自分支里构造条件 flag。
+
+    只有这两边都足够“表达式化”时，才能安全从语句级 if 提升为 `?:`。
+    """
     then_blocks = sorted(region.then_region.blocks)
     else_blocks = sorted(region.else_region.blocks)
 
@@ -3802,6 +4136,11 @@ def _try_ternary_from_regions(region: Region, cfg: CFG, instructions: List[Instr
         else_reg, else_side = else_target
 
         if then_reg == else_reg and then_reg > 0:
+            # 典型例子：
+            #   if (cond) r5 = a;
+            #   else      r5 = b;
+            # 可压成：
+            #   r5 = cond ? a : b;
             result = _try_register_ternary(
                 region, cfg, instructions, decompiler, obj, condition, then_reg
             )
@@ -3810,6 +4149,10 @@ def _try_ternary_from_regions(region: Region, cfg: CFG, instructions: List[Instr
 
     if _is_flag_only_branch(cfg, instructions, then_blocks) and \
        _is_flag_only_branch(cfg, instructions, else_blocks):
+        # 另一类典型例子：
+        #   if (cond) flag = (a < b);
+        #   else      flag = (c == d);
+        # 这时可以把“flag 的值”恢复成 `cond ? (a < b) : (c == d)`。
         result = _try_flag_ternary(
             region, cfg, instructions, decompiler, obj, condition
         )
@@ -3819,6 +4162,13 @@ def _try_ternary_from_regions(region: Region, cfg: CFG, instructions: List[Instr
     return None
 
 def _finalize_pending_literal(decompiler: 'Decompiler', reg: int) -> Optional[Expr]:
+    """把寄存器上的延迟字面量真正实体化。
+
+    数组/字典在反编译器里常先存在 `pending_arrays/pending_dicts` 中，
+    直到真正需要作为表达式读取时，才拼成 `ArrayExpr/DictExpr`。
+    这里是三元表达式恢复链中一个很关键的小步骤，否则 `target_reg`
+    可能看起来还是“半成品”。
+    """
     if reg in decompiler.pending_dicts:
         items = decompiler.pending_dicts.pop(reg)
         result = DictExpr(items)
@@ -3835,6 +4185,14 @@ def _finalize_pending_literal(decompiler: 'Decompiler', reg: int) -> Optional[Ex
 def _try_register_ternary(region: Region, cfg: CFG, instructions: List[Instruction],
                            decompiler: 'Decompiler', obj: CodeObject,
                            condition: Expr, target_reg: int) -> Optional[List[Stmt]]:
+    """按“同一目标寄存器”路径尝试恢复三元表达式。
+
+    思路是：
+    1. 先保存当前反编译状态；
+    2. 在 then 分支里独立生成，看看 `target_reg` 最后变成了什么表达式；
+    3. 再对 else 分支做同样的事；
+    4. 如果两边都只产生表达式语句，没有结构化语句副作用，就合并成 `?:`。
+    """
     snapshot = decompiler._save_speculative_state()
 
     decompiler._restore_speculative_state(snapshot)
@@ -3850,22 +4208,29 @@ def _try_register_ternary(region: Region, cfg: CFG, instructions: List[Instructi
     def _has_non_expr_stmts(stmts):
         return any(not isinstance(s, ExprStmt) for s in stmts)
     if _has_non_expr_stmts(then_stmts) or _has_non_expr_stmts(else_stmts):
+        # 一旦分支里出现 if/while/return/break 之类语句，就不能安全压成单个表达式。
         return None
     if true_expr is None or false_expr is None:
+        # 任一分支没有稳定地产出目标寄存器值，也不能恢复成三元。
         return None
 
     if then_stmts:
+        # 若分支里除了最终值，还有前置表达式副作用，则转成逗号表达式：
+        #   (side1, side2, finalValue)
         true_expr = CommaExpr([s.expr for s in then_stmts] + [true_expr])
     if else_stmts:
         false_expr = CommaExpr([s.expr for s in else_stmts] + [false_expr])
 
     ternary = TernaryExpr(condition, true_expr, false_expr)
+    # 这里不是直接返回赋值语句，而是把“目标寄存器现在代表这个三元表达式”
+    # 写回 decompiler 状态，让后续上层按需要继续包成赋值或更大表达式。
     decompiler.regs[target_reg] = ternary
 
     return []
 
 def _is_flag_only_branch(cfg: CFG, instructions: List[Instruction],
                           block_ids: List[int]) -> bool:
+    """判断一个分支是否只是在构造 flag，而没有其他不可表达式化的副作用。"""
     _FLAG_OPS = {VM.CGT, VM.CLT, VM.CEQ, VM.CDEQ, VM.TT, VM.TF, VM.SETF, VM.SETNF, VM.NF}
     _CONTROL_OPS = {VM.JF, VM.JNF, VM.JMP, VM.NOP}
     _TEMP_WRITE_OPS = {VM.CONST, VM.CP, VM.CL, VM.GPD, VM.GPDS, VM.GPI, VM.GPIS,
@@ -3887,10 +4252,12 @@ def _is_flag_only_branch(cfg: CFG, instructions: List[Instruction],
             op = instr.op
 
             if op in _FLAG_OPS:
+                # 这些指令都可视为“在拼装最终条件值”。
                 has_flag_op = True
             elif op in _CONTROL_OPS:
                 continue
             elif op in _TEMP_WRITE_OPS:
+                # 某些临时写入是允许的，但不能写本地变量，也不能变成纯副作用调用。
                 if op == VM.CP and instr.operands[0] < -2:
                     return False
                 if op in (VM.ADD, VM.SUB, VM.MUL, VM.DIV, VM.MOD, VM.IDIV,
@@ -3901,6 +4268,7 @@ def _is_flag_only_branch(cfg: CFG, instructions: List[Instruction],
                     return False
             elif op in (VM.SPD, VM.SPDE, VM.SPDEH, VM.SPDS, VM.SPI, VM.SPIE, VM.SPIS,
                         VM.SRV, VM.RET):
+                # 一旦碰到属性写入或返回，说明这个分支已经不是“纯 flag 构造”了。
                 return False
 
     return has_flag_op
@@ -3908,6 +4276,12 @@ def _is_flag_only_branch(cfg: CFG, instructions: List[Instruction],
 def _try_flag_ternary(region: Region, cfg: CFG, instructions: List[Instruction],
                        decompiler: 'Decompiler', obj: CodeObject,
                        condition: Expr) -> Optional[List[Stmt]]:
+    """按“flag-only 分支”路径尝试恢复三元表达式。
+
+    这条路径不关心目标寄存器，而是关心：
+    then/else 两边最终分别会把 `decompiler.flag` 变成什么条件表达式。
+    若两边都没有额外语句，则可把 flag 合并成一个三元条件。
+    """
     snapshot = decompiler._save_speculative_state()
 
     decompiler._restore_speculative_state(snapshot)
@@ -3921,9 +4295,11 @@ def _try_flag_ternary(region: Region, cfg: CFG, instructions: List[Instruction],
     decompiler._restore_speculative_state(snapshot)
 
     if then_stmts or else_stmts:
+        # 只允许“纯条件构造”，不允许有额外表达式/语句残留。
         return None
 
     ternary_cond = TernaryExpr(condition, true_cond, false_cond)
+    # 与寄存器型类似，这里把结果写回 flag，而不是立即生成语句。
     decompiler.flag = ternary_cond
     decompiler.flag_negated = False
 
@@ -3931,6 +4307,12 @@ def _try_flag_ternary(region: Region, cfg: CFG, instructions: List[Instruction],
 
 def _find_branch_target_reg(cfg: CFG, instructions: List[Instruction],
                              block_ids: List[int]) -> Optional[Tuple[int, bool]]:
+    """粗略找出一个分支最终主要在“产出哪个目标寄存器”。
+
+    这个函数并不要求完全精确，它更像一个启发式过滤器：
+    - 若 then/else 看起来都在围绕同一个正寄存器产值，才值得继续尝试寄存器型三元；
+    - 若分支里明显夹杂了副作用，本函数也会把这一点带回给调用者。
+    """
     target_reg = None
     has_side_effects = False
     last_was_flag_op = False
@@ -3948,6 +4330,7 @@ def _find_branch_target_reg(cfg: CFG, instructions: List[Instruction],
             ops = instr.operands
 
             if op == VM.CONST:
+                # 直接把常量写进某寄存器，是最典型的三元候选信号。
                 if new_target_reg is not None and ops[0] == new_target_reg + 1:
                     new_target_reg = None
                 else:
@@ -3957,6 +4340,7 @@ def _find_branch_target_reg(cfg: CFG, instructions: List[Instruction],
             elif op == VM.CP:
                 r1 = ops[0]
                 if r1 < -2:
+                    # 写本地变量意味着分支不再只是“算一个表达式值”。
                     has_side_effects = True
                 target_reg = r1
                 new_target_reg = None
@@ -3971,6 +4355,7 @@ def _find_branch_target_reg(cfg: CFG, instructions: List[Instruction],
                 last_was_flag_op = False
             elif op in (VM.CALL, VM.CALLD, VM.CALLI):
                 if ops[0] == 0:
+                    # 返回值直接丢弃的调用通常说明有副作用，不适合做寄存器型三元。
                     if op in (VM.CALLD, VM.CALLI) and len(ops) > 1 and ops[1] in local_new_regs:
                         target_reg = ops[1]
                     else:
@@ -3981,6 +4366,7 @@ def _find_branch_target_reg(cfg: CFG, instructions: List[Instruction],
                 new_target_reg = None
                 last_was_flag_op = False
             elif op == VM.NEW:
+                # `new` 经常先产出一个对象寄存器，再在分支末尾作为最终值使用。
                 target_reg = ops[0]
                 new_target_reg = ops[0]
                 local_new_regs.add(ops[0])
@@ -4066,6 +4452,7 @@ def _find_branch_target_reg(cfg: CFG, instructions: List[Instruction],
     return None
 
 def _find_subregion_by_header(region, target_block_id):
+    """在 Region 子树中按 header_block 查找目标子 Region。"""
     if region is None:
         return None
     if region.header_block == target_block_id:
@@ -4084,6 +4471,7 @@ def _find_subregion_by_header(region, target_block_id):
     return None
 
 def _extract_counter_register(instructions: List, header) -> 'Optional[int]':
+    """从循环头附近倒推一个可能的计数器寄存器。"""
     for idx in range(header.end_idx - 1, header.start_idx - 1, -1):
         ins = instructions[idx]
         if ins.op in (VM.CLT, VM.CGT, VM.CEQ, VM.CDEQ):
@@ -4096,6 +4484,7 @@ def _extract_counter_register(instructions: List, header) -> 'Optional[int]':
     return None
 
 def _writes_to_counter(ins, counter_reg: int) -> bool:
+    """判断一条指令是否在更新给定计数器寄存器。"""
     if ins.op in (VM.INC, VM.DEC) and ins.operands[0] == counter_reg:
         return True
     if ins.op in (VM.ADD, VM.SUB) and ins.operands[0] == counter_reg:
@@ -4110,6 +4499,7 @@ def _writes_to_counter(ins, counter_reg: int) -> bool:
 
 def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
                      decompiler: 'Decompiler', obj: CodeObject) -> List[Stmt]:
+    """恢复 `while`，并在可能时进一步提升为 `for`。"""
     loop_info = region.loop_info
     header = cfg.get_block(region.header_block)
     if header is None or loop_info is None:
@@ -4118,6 +4508,7 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
     compound_chain_used = False
     chain_result = _detect_condition_chain(cfg, region.header_block, instructions)
     if chain_result is not None:
+        # `while (a && b && c)` 这类条件链经常跨多个基本块，这里先把条件整体拼好。
         chain_blocks_list, chain_body, chain_else, chain_nf_ids = chain_result
         chain_body_in_body = chain_body in loop_info.body_blocks
         chain_else_in_exit = chain_else in loop_info.exit_blocks
@@ -4185,6 +4576,8 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
     if hasattr(region, '_compound_extracted'):
         extra_cond_blocks, extra_preamble_stmts = region._compound_extracted
     elif body_region and loop_info.exit_blocks:
+        # 有些 while 条件的一部分并不在 header，而是藏在循环体开头的
+        # “若条件不满足则 break” 结构里，这里尝试把它们重新并回 while 条件。
         extra_cond_blocks, extra_preamble_stmts = _extract_compound_conditions(
             cfg, instructions, decompiler, obj, region, body_region, loop_info
         )
@@ -4206,6 +4599,7 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
     tail_start_addr = instructions[tail.start_idx].addr if tail else None
     _has_tail_jmp = False
     if tail and tail_start_addr is not None and tail_start_addr != loop_start_addr:
+        # 查找是否存在“统一跳到尾块执行 update”的形状。
         for bid in loop_info.body_blocks:
             if bid == loop_info.back_edge_source or bid == loop_info.header:
                 continue
@@ -4225,6 +4619,7 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
     if _has_tail_jmp and tail:
         _counter_reg = _extract_counter_register(instructions, header)
         if _counter_reg is not None:
+            # 只有尾块看起来像纯计数器更新，才适合把 while 提升成 for。
             first_tail_ins = instructions[tail.start_idx]
             if _writes_to_counter(first_tail_ins, _counter_reg):
                 _tail_is_pure = True
@@ -4235,6 +4630,8 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
 
     _body_bypasses_tail = False
     if _has_tail_jmp:
+        # 如果循环体里还有其他路径直接跳回 header，就说明 update 并不统一，
+        # 这时强行恢复成 for 会改变 continue 语义。
         for bid in loop_info.body_blocks:
             if bid == loop_info.back_edge_source or bid == loop_info.header:
                 continue
@@ -4254,6 +4651,8 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
     continue_target = tail_start_addr if has_for_continue else loop_start_addr
 
     if has_for_continue:
+        # 如果循环尾块是“纯 update 逻辑”，并且 continue 统一跳向该尾块，
+        # 就可以把 while 提升成 for。
         tail_block_id = loop_info.back_edge_source
         body_loop_context = (loop_start_addr, loop_exit_addr, tail_start_addr)
 
@@ -4294,9 +4693,11 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
                         body_stmts.extend(update_stmts[:-1])
 
         if update_expr is not None:
+            # 成功提取出 update 表达式，正式输出 for。
             for_stmt = ForStmt(init=None, condition=loop_cond, update=update_expr, body=body_stmts)
             return preamble_stmts + [for_stmt]
         else:
+            # 尾块里混有非表达式语句时，退回 while 更安全。
             if tail_block:
                 fallback_stmts = _generate_block_for_update(
                     tail_block, instructions, decompiler, obj
@@ -4319,6 +4720,8 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
             body_stmts.pop()
 
         if preamble_stmts and tail and tail.terminator in ('jf', 'jnf'):
+            # 头部前导语句 + 尾部条件这种形状，更像 do-while：
+            # 先执行一轮主体，再在末尾判断。
             real_body = []
             for s in body_stmts:
                 if isinstance(s, IfStmt) and not s.then_body and not s.else_body:
@@ -4327,6 +4730,8 @@ def _generate_while(region: Region, cfg: CFG, instructions: List[Instruction],
             return [DoWhileStmt(loop_cond, preamble_stmts + real_body)]
 
         if has_header_preamble:
+            # 条件前还必须先执行副作用时，直接生成 `while (cond)` 会失真，
+            # 这里退化成 `while (true) { preamble; if (!cond) break; ... }`。
             loop_body = list(preamble_stmts)
             loop_body.append(
                 IfStmt(decompiler._negate_expr(loop_cond), [BreakStmt()])
@@ -4341,6 +4746,7 @@ def _extract_compound_conditions(cfg: CFG, instructions: List[Instruction],
                                    while_region: Region,
                                    body_region: Region, loop_info: LoopInfo
                                    ) -> Tuple[List[Expr], List[Stmt]]:
+    """从循环体开头连续的 guard-if 中提取并合并复合 while 条件。"""
     extra_conds = []
     all_preamble_stmts = []
 
@@ -4349,6 +4755,8 @@ def _extract_compound_conditions(cfg: CFG, instructions: List[Instruction],
     current_region = body_region
 
     while True:
+        # 只吸收循环体最开头连续出现的 if-region；
+        # 一旦前缀被别的结构打断，就停止提取复合条件。
         if current_region.type == RegionType.SEQUENCE and current_region.children:
             first_child = current_region.children[0]
         else:
@@ -4378,6 +4786,7 @@ def _extract_compound_conditions(cfg: CFG, instructions: List[Instruction],
         extra_cond = _detect_assignment_in_condition(block_preamble, extra_cond)
         all_preamble_stmts.extend(block_preamble)
 
+        # 把条件统一转换成“继续留在循环里需要满足什么”。
         if cond_block.terminator == 'jnf' and else_exits_loop:
             pass
         elif cond_block.terminator == 'jf' and then_exits_loop:
@@ -4404,6 +4813,7 @@ def _extract_compound_conditions(cfg: CFG, instructions: List[Instruction],
                 keep_region = first_child.then_region
 
         if current_region.type == RegionType.SEQUENCE:
+            # 在 sequence 里把已吸收的 guard-if 从头部摘掉，继续看下一个。
             current_region.children.pop(0)
             if keep_region:
                 current_region.children.insert(0, keep_region)
@@ -4424,6 +4834,7 @@ def _extract_compound_conditions(cfg: CFG, instructions: List[Instruction],
     return extra_conds, all_preamble_stmts
 
 def _is_compound_dowhile(loop_info: LoopInfo) -> bool:
+    """判断 do-while 是否由多个 back-edge 共同形成尾部条件链。"""
     return (loop_info.loop_type == 'do_while'
             and len(loop_info.all_back_edge_sources) > 1)
 
@@ -4432,11 +4843,14 @@ def _build_compound_dowhile_cond(
         header_addr: int,
         instructions: List[Instruction],
         decompiler: 'Decompiler', obj: CodeObject) -> Tuple[Expr, List[Stmt]]:
+    """把多个尾条件块折叠成 do-while 最终使用的一条布尔表达式。"""
     or_groups = []
     and_chain = []
     all_preamble = []
 
     for start_idx, end_idx, terminator in cond_ranges:
+        # 每个 cond_range 都是一个尾条件片段：
+        # 先执行若干求值指令，最后再通过跳转决定是否继续下一轮。
         for idx in range(start_idx, end_idx):
             instr = instructions[idx]
             if instr.op in (VM.JF, VM.JNF, VM.JMP):
@@ -4455,6 +4869,8 @@ def _build_compound_dowhile_cond(
             target = None
 
         if target == header_addr:
+            # 满足该条件后会直接回到 loop header，说明当前 and_chain 已经
+            # 构成“一组可以放行下一轮”的子条件，可以在这里封组。
             if terminator == 'jf':
                 and_chain.append(cond)
             else:
@@ -4485,6 +4901,7 @@ def _build_compound_dowhile_cond(
     return ConstExpr(True), all_preamble
 
 def _strip_dowhile_merge_continues(stmts):
+    """去掉 do-while 末尾因 merge 回填而遗留的空 continue。"""
     while stmts and isinstance(stmts[-1], ContinueStmt):
         stmts.pop()
     if not stmts:
@@ -4506,6 +4923,7 @@ def _strip_dowhile_merge_continues(stmts):
             _strip_dowhile_merge_continues(last.catch_body)
 
 def _negate_condition(expr):
+    """尽量结构化地对条件取反，避免无意义地层层套 `!`。"""
     if isinstance(expr, UnaryExpr) and expr.op == '!':
         return expr.operand
     if isinstance(expr, BinaryExpr):
@@ -4521,6 +4939,7 @@ def _negate_condition(expr):
 
 def _generate_do_while(region: Region, cfg: CFG, instructions: List[Instruction],
                         decompiler: 'Decompiler', obj: CodeObject) -> List[Stmt]:
+    """生成 do-while 语句，兼容自环头判定和多尾块复合条件。"""
     loop_info = region.loop_info
     if loop_info is None:
         return []
@@ -4547,6 +4966,7 @@ def _generate_do_while(region: Region, cfg: CFG, instructions: List[Instruction]
     body_loop_context = (loop_start_addr, loop_exit_addr, continue_target_addr)
 
     if is_self_loop:
+        # 自环块里，header 前半截通常是真正的 body，尾部几条才是条件回跳。
         cond_start_idx = header.start_idx
         back_jump_idx = header.end_idx - 1
 
@@ -4594,6 +5014,8 @@ def _generate_do_while(region: Region, cfg: CFG, instructions: List[Instruction]
         body_stmts.extend(cond_preamble)
     else:
         if _is_compound_dowhile(loop_info):
+            # 多个 back-edge 往往对应源码里的复合尾条件，
+            # 例如 `while (a && b)` 被拆成多段守卫跳转。
             cond_start_idx = header.start_idx
             back_jump_idx = header.end_idx - 1
             for j in range(back_jump_idx - 1, header.start_idx - 1, -1):
@@ -4736,6 +5158,7 @@ def _generate_do_while(region: Region, cfg: CFG, instructions: List[Instruction]
         last = body_stmts[-1]
         if (isinstance(last, IfStmt) and
                 not last.then_body and not last.else_body):
+            # 空体 if 在这里可视为“尚未并回循环头”的补充条件。
             chain_conds.append(last.condition)
             body_stmts.pop()
         else:
@@ -4752,6 +5175,7 @@ def _generate_do_while(region: Region, cfg: CFG, instructions: List[Instruction]
 
 def _generate_infinite(region: Region, cfg: CFG, instructions: List[Instruction],
                         decompiler: 'Decompiler', obj: CodeObject) -> List[Stmt]:
+    """生成无限循环 `while (true)`，并保留循环内控制流语义。"""
     loop_info = region.loop_info
     if loop_info is None:
         return []
@@ -4795,6 +5219,7 @@ def _generate_infinite(region: Region, cfg: CFG, instructions: List[Instruction]
 def _generate_switch(region: Region, cfg: CFG, instructions: List[Instruction],
                       decompiler: 'Decompiler', obj: CodeObject,
                       loop_context: Optional[Tuple[int, int, int]]) -> List[Stmt]:
+    """生成 switch，处理 case 共享体、fall-through 和补 break。"""
     if not region.switch_cases:
         return []
 
@@ -4837,6 +5262,7 @@ def _generate_switch(region: Region, cfg: CFG, instructions: List[Instruction],
     for i in range(first_block.start_idx, first_block.end_idx):
         instr = instructions[i]
         if instr.op == VM.CEQ:
+            # 进入第一条 CEQ 前，switch 的参考表达式通常已经准备在 ref_reg 对应寄存器里。
             switch_expr = decompiler.regs.get(ref_reg)
             break
         stmt = decompiler._translate_instruction(instr, obj)
@@ -4850,8 +5276,11 @@ def _generate_switch(region: Region, cfg: CFG, instructions: List[Instruction],
     cases = []
 
     for sc in region.switch_cases:
+        # case 之间可能共享同一片 body blocks，这种共享在源码里通常表现为
+        # fall-through，因此后面对 break 的补写要格外谨慎。
         case_val_expr = None
         if sc.value_expr is not None and sc.cond_block_id is not None:
+            # 尽量把 case 标签恢复成真正常量，而不是退化成 `%reg`。
             cb = cfg.get_block(sc.cond_block_id)
             if cb is not None:
                 ceq_reg = sc.value_expr
@@ -4878,6 +5307,7 @@ def _generate_switch(region: Region, cfg: CFG, instructions: List[Instruction],
 
         body_stmts = []
         if sc.body_is_continue:
+            # switch 嵌在循环里时，有些 case 体本质只是 continue。
             body_stmts = [ContinueStmt()]
         elif sc.body_region is not None:
             if switch_break_addr is not None:
@@ -4891,6 +5321,8 @@ def _generate_switch(region: Region, cfg: CFG, instructions: List[Instruction],
 
             if body_stmts and isinstance(body_stmts[-1], BreakStmt):
                 if switch_break_addr is not None:
+                    # 如果最后这个 break 只是“跳出 switch”，可以把它从 body 内拿掉，
+                    # 并转写到 case 元信息里，最终由 case 尾部统一补。
                     last_body_blocks = sorted(sc.body_blocks)
                     is_switch_break = False
                     for bbid in reversed(last_body_blocks):
@@ -4927,12 +5359,14 @@ def _generate_switch(region: Region, cfg: CFG, instructions: List[Instruction],
                             break
 
         if sc.fall_through and body_stmts and isinstance(body_stmts[-1], BreakStmt):
+            # fall-through case 绝不能以 break 结尾。
             body_stmts.pop()
 
         if sc.has_continue and not sc.has_break and not sc.fall_through and not sc.body_is_continue:
             if not body_stmts or not isinstance(body_stmts[-1], ContinueStmt):
                 body_stmts.append(ContinueStmt())
         elif sc.has_break and not sc.fall_through:
+            # CFG 明确显示该 case 跳出 switch，但 body 中没自然生成 break 时，这里补上。
             body_stmts.append(BreakStmt())
 
         cases.append((case_val_expr, body_stmts))
@@ -4942,11 +5376,13 @@ def _generate_switch(region: Region, cfg: CFG, instructions: List[Instruction],
 def _generate_try_catch(region: Region, cfg: CFG, instructions: List[Instruction],
                          decompiler: 'Decompiler', obj: CodeObject,
                          loop_context: Optional[Tuple[int, int, int]]) -> List[Stmt]:
+    """把 TRY_CATCH Region 生成为 TryStmt。"""
     entry_block = cfg.get_block(region.header_block)
     if entry_block is None:
         return []
 
     if region.try_region is None and region.catch_region is None:
+        # 如果 try/catch 结构没成功细分，保守退回线性代码生成。
         block_ids = sorted(region.blocks)
         min_idx = min(cfg.get_block(b).start_idx for b in block_ids if cfg.get_block(b))
         max_idx = max(cfg.get_block(b).end_idx for b in block_ids if cfg.get_block(b))
@@ -4962,6 +5398,7 @@ def _generate_try_catch(region: Region, cfg: CFG, instructions: List[Instruction
     preamble_stmts = []
     idx = entry_block.start_idx
     while idx < preamble_end:
+        # ENTRY 前面也可能有普通前导计算，要保留下来放在 try 之前。
         instr = instructions[idx]
         swap_result = decompiler._try_detect_swap(instructions, obj, idx, preamble_end)
         if swap_result:
@@ -4983,6 +5420,9 @@ def _generate_try_catch(region: Region, cfg: CFG, instructions: List[Instruction
     if catch_block:
         first_catch_instr = instructions[catch_block.start_idx]
         if first_catch_instr.op == VM.CP:
+            # catch 开头常见模式：
+            #   CP localE, exception_reg
+            # 这相当于 `catch(localE)`。
             dest_reg = first_catch_instr.operands[0]
             src_reg = first_catch_instr.operands[1]
             if src_reg == region.exception_reg and dest_reg < -2:
@@ -4991,6 +5431,7 @@ def _generate_try_catch(region: Region, cfg: CFG, instructions: List[Instruction
                 has_catch_cp = True
 
     if catch_var_name is None:
+        # 没有显式局部变量时，为 catch 人工补一个异常名。
         if region.exception_reg is not None and region.exception_reg < -2:
             catch_var_name = decompiler._get_local_name(region.exception_reg)
         else:
@@ -5013,6 +5454,7 @@ def _generate_try_catch(region: Region, cfg: CFG, instructions: List[Instruction
         tc_loop_context = (loop_context[0], loop_context[1], decompiler._for_loop_update_addr)
 
     if region.try_region:
+        # try 和 catch 要在相同入口状态下分别生成，避免互相污染寄存器推断。
         try_stmts = generate_code(region.try_region, cfg, instructions, decompiler, obj, loop_context)
 
     decompiler.regs = dict(saved_regs)
@@ -5026,6 +5468,7 @@ def _generate_try_catch(region: Region, cfg: CFG, instructions: List[Instruction
     if region.catch_region:
         catch_stmts = generate_code(region.catch_region, cfg, instructions, decompiler, obj, tc_loop_context)
         if has_catch_cp and catch_stmts:
+            # `catch (e)` 已经体现在 catch 参数里，就不再把开头那条 `e = ex` 留在 body 中。
             catch_stmts = catch_stmts[1:]
 
     decompiler.regs = dict(saved_regs)

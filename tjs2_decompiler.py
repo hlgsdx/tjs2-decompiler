@@ -1,3 +1,18 @@
+"""TJS2 反编译器主模块。
+
+这个文件同时包含了几层核心能力：
+
+1. TJS2 VM 指令与常量/上下文枚举定义；
+2. 反编译过程中使用的表达式/语句 AST；
+3. TJS2 字节码文件加载器；
+4. 线性字节码反编译逻辑；
+5. 命令行入口与批量处理工具。
+
+如果你是第一次阅读这个项目，推荐按下面顺序理解：
+`VM / CodeObject / Instruction` -> `BytecodeLoader` -> `decode_instructions`
+-> `Decompiler` -> `tjs2_cfg.py` -> `tjs2_structuring.py`
+"""
+
 import argparse
 import math
 import os
@@ -13,6 +28,18 @@ from abc import ABC, abstractmethod
 from tjs2_formatting import format_source
 
 class VM(IntEnum):
+    """TJS2 虚拟机操作码。
+
+    命名规律非常重要，理解后读代码会轻松很多：
+
+    - 基础二元运算如 `ADD` / `SUB` / `LOR`
+    - `...PD` 往往表示 property dot：对 `obj.prop` 形式操作
+    - `...PI` 往往表示 property index：对 `obj[idx]` 形式操作
+    - `...P`  则常是“属性相关但参数布局更紧凑”的变体
+
+    例如 `ADD`、`ADDPD`、`ADDPI`、`ADDP` 语义都围绕加法，但操作目标
+    分别可能是寄存器、点属性、索引属性和其他属性写回场景。
+    """
     NOP = 0; CONST = 1; CP = 2; CL = 3; CCL = 4; TT = 5; TF = 6
     CEQ = 7; CDEQ = 8; CLT = 9; CGT = 10; SETF = 11; SETNF = 12
     LNOT = 13; NF = 14; JF = 15; JNF = 16; JMP = 17
@@ -46,14 +73,17 @@ class VM(IntEnum):
     ADDCI = 125; REGMEMBER = 126; DEBUGGER = 127
 
 class DataType(IntEnum):
+    """数据区常量类型枚举。"""
     VOID = 0; OBJECT = 1; INTER_OBJECT = 2; STRING = 3; OCTET = 4
     REAL = 5; BYTE = 6; SHORT = 7; INTEGER = 8; LONG = 9
 
 class ContextType(IntEnum):
+    """代码对象上下文类型。"""
     TOP_LEVEL = 0; FUNCTION = 1; EXPR_FUNCTION = 2; PROPERTY = 3
     PROPERTY_SETTER = 4; PROPERTY_GETTER = 5; CLASS = 6; SUPER_CLASS_GETTER = 7
 
 BINARY_OP_SYMBOLS = {
+    # 仅列出可以直接恢复为中缀表达式的指令。
     VM.LOR: '||', VM.LAND: '&&', VM.BOR: '|', VM.BXOR: '^', VM.BAND: '&',
     VM.SAR: '>>', VM.SAL: '<<', VM.SR: '>>>',
     VM.ADD: '+', VM.SUB: '-', VM.MUL: '*', VM.DIV: '/', VM.MOD: '%', VM.IDIV: '\\',
@@ -61,6 +91,7 @@ BINARY_OP_SYMBOLS = {
 }
 
 OP_PRECEDENCE = {
+    # 用于决定什么时候需要补括号，数值越大优先级越高。
     '||': 1, '&&': 2, '|': 3, '^': 4, '&': 5,
     '==': 6, '===': 6, '!=': 6, '!==': 6,
     '<': 7, '>': 7, '<=': 7, '>=': 7, 'instanceof': 7,
@@ -70,6 +101,11 @@ OP_PRECEDENCE = {
 
 @dataclass
 class CodeObject:
+    """字节码中的“代码对象”。
+
+    它既可能是顶层脚本，也可能是函数、类体、属性访问器等。
+    `code` 保存原始 16 位指令流，`data` 是解析过的数据表。
+    """
     index: int
     name: str
     parent: int
@@ -90,20 +126,26 @@ class CodeObject:
 
 @dataclass
 class Instruction:
+    """已经解码的一条指令。"""
     addr: int
     op: int
     operands: List[int]
     size: int
 
 class Expr(ABC):
+    """所有表达式节点的抽象基类。"""
     @abstractmethod
     def to_source(self) -> str:
+        """把当前表达式节点还原成 TJS2 源码。"""
         pass
 
     def precedence(self) -> int:
+        """返回运算优先级，默认给最高值表示通常不需要补括号。"""
         return 100
 
 def _escape_str_literal(s: str) -> str:
+    """把字符串转成可安全输出到 TJS2 源码中的字面量。"""
+    # 这里统一处理反斜杠、引号、控制字符和代理区字符，避免生成非法源码。
     escaped = s.replace('\\', '\\\\').replace('"', '\\"')
     escaped = escaped.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
     result = []
@@ -122,6 +164,14 @@ class ConstExpr(Expr):
     value: Any
 
     def to_source(self) -> str:
+        """把常量恢复为 TJS2 文本。
+
+        这里处理了几个反编译里常见的边角：
+        - `None` -> `void`
+        - `float('inf')` / `nan`
+        - bytes -> octet 字面量
+        - 特定字符串编码出来的正则表达式
+        """
         if self.value is None:
             return 'void'
         elif isinstance(self.value, str):
@@ -145,6 +195,8 @@ class ConstExpr(Expr):
         return str(self.value)
 
     def _format_regex(self, s: str) -> str:
+        """还原被编码到字符串里的正则字面量。"""
+        # TJS2 有时会把正则先编码成字符串常量，这里再把它恢复成正则字面量。
         rest = s[2:]
         slash_pos = rest.find('/')
         if slash_pos == -1:
@@ -158,46 +210,55 @@ class VarExpr(Expr):
     name: str
 
     def to_source(self) -> str:
+        """把变量节点还原成源码中的名字。"""
         return self.name
 
 @dataclass
 class ThisExpr(Expr):
     def to_source(self) -> str:
+        """输出 `this`。"""
         return 'this'
 
 @dataclass
 class ThisProxyExpr(Expr):
     def to_source(self) -> str:
+        """输出代表当前 `this` 的代理节点。"""
         return 'this'
 
 @dataclass
 class WithThisExpr(Expr):
     def to_source(self) -> str:
+        """在 `with` 恢复过程中输出当前作用域的 `this`。"""
         return 'this'
 
 @dataclass
 class GlobalExpr(Expr):
     def to_source(self) -> str:
+        """输出全局对象。"""
         return 'global'
 
 class WithDotProxy(Expr):
     def to_source(self) -> str:
+        """占位表示 `with` 下的点属性访问，单独输出时退化为 `global`。"""
         return 'global'
 
 @dataclass
 class VoidExpr(Expr):
     def to_source(self) -> str:
+        """输出 `void` 字面量。"""
         return 'void'
 
 @dataclass
 class OmittedArgExpr(Expr):
     def to_source(self) -> str:
+        """输出省略参数，在参数列表中表现为空槽。"""
         return ''
 
 @dataclass
 class NullExpr(Expr):
     comment: str = ''
     def to_source(self) -> str:
+        """输出 `null`，必要时附带行内说明注释。"""
         if self.comment:
             return f'null /* {self.comment} */'
         return 'null'
@@ -208,6 +269,7 @@ class FuncRefExpr(Expr):
     loader: Any
 
     def to_source(self) -> str:
+        """尽量把函数引用还原成对象名，否则退化成 `<func#N>`。"""
         if self.loader and 0 <= self.obj_index < len(self.loader.objects):
             obj = self.loader.objects[self.obj_index]
             if obj.name:
@@ -220,6 +282,7 @@ class AnonFuncExpr(Expr):
     body: str
 
     def to_source(self) -> str:
+        """输出匿名函数，单行 `return` 体会尽量保持紧凑。"""
         args_str = ', '.join(self.args)
         body_stripped = self.body.strip()
         if body_stripped.startswith('return ') and '\n' not in body_stripped:
@@ -234,11 +297,14 @@ class BinaryExpr(Expr):
     right: Expr
 
     def to_source(self) -> str:
+        """按中缀形式输出二元表达式。"""
         left_src = self._wrap_if_needed(self.left, 'left')
         right_src = self._wrap_if_needed(self.right, 'right')
         return f'{left_src} {self.op} {right_src}'
 
     def _wrap_if_needed(self, expr: Expr, side: str) -> str:
+        """按操作符优先级判断二元表达式子项是否需要补括号。"""
+        # 重点是避免 `a + (b * c)` 这类结构在输出时因为少括号而改变语义。
         src = expr.to_source()
         if isinstance(expr, BinaryExpr):
             my_prec = OP_PRECEDENCE.get(self.op, 0)
@@ -254,6 +320,7 @@ class BinaryExpr(Expr):
         return src
 
     def precedence(self) -> int:
+        """返回当前二元运算符的优先级。"""
         return OP_PRECEDENCE.get(self.op, 0)
 
 @dataclass
@@ -263,6 +330,7 @@ class UnaryExpr(Expr):
     prefix: bool = True
 
     def to_source(self) -> str:
+        """输出前缀或后缀一元表达式，必要时为子项补括号。"""
         src = self.operand.to_source()
         if isinstance(self.operand, (BinaryExpr, InstanceofExpr, InContextOfExpr, TernaryExpr)):
             src = f'({src})'
@@ -279,6 +347,7 @@ class TypeCastExpr(Expr):
     operand: Expr
 
     def to_source(self) -> str:
+        """输出类型转换调用。"""
         return f'{self.cast_type}({self.operand.to_source()})'
 
 @dataclass
@@ -287,6 +356,13 @@ class PropertyExpr(Expr):
     prop: Union[str, Expr]
 
     def to_source(self) -> str:
+        """输出属性访问表达式。
+
+        `with` 场景下会尽量恢复成更接近原源码的短写法：
+        - `foo`
+        - `.foo`
+        否则退化为普通的 `obj.prop` / `obj["prop"]` / `obj[idx]`。
+        """
         if isinstance(self.obj, (WithThisExpr, ThisProxyExpr)) and isinstance(self.prop, str):
             if self.prop.isidentifier() and not self.prop.startswith('%'):
                 return self.prop
@@ -317,6 +393,7 @@ class CallExpr(Expr):
     is_new: bool = False
 
     def to_source(self) -> str:
+        """输出普通函数调用或 `new` 构造调用。"""
         args_src = ', '.join(
             f'({a.to_source()})' if isinstance(a, AssignExpr) else a.to_source()
             for a in self.args
@@ -336,9 +413,12 @@ class MethodCallExpr(Expr):
 
     @staticmethod
     def _fmt_arg(a: Expr) -> str:
+        """格式化单个方法实参，必要时给赋值表达式补括号。"""
+        # 例如 `foo(a = 1)` 需要保留括号，否则在某些上下文里会显得像语句而不是实参。
         return f'({a.to_source()})' if isinstance(a, AssignExpr) else a.to_source()
 
     def to_source(self) -> str:
+        """输出方法调用，逻辑与 `PropertyExpr` 类似，但结尾会接参数列表。"""
         if isinstance(self.obj, (WithThisExpr, ThisProxyExpr)) and isinstance(self.method, str):
             args_src = ', '.join(self._fmt_arg(a) for a in self.args)
             if self.method.isidentifier():
@@ -373,6 +453,7 @@ class AssignExpr(Expr):
     op: str = '='
 
     def to_source(self) -> str:
+        """输出赋值或复合赋值表达式。"""
         return f'{self.target.to_source()} {self.op} {self.value.to_source()}'
 
 @dataclass
@@ -382,6 +463,7 @@ class TernaryExpr(Expr):
     false_val: Expr
 
     def to_source(self) -> str:
+        """输出三元表达式，并为条件部分做基本括号处理。"""
         cond_src = self.cond.to_source()
         if isinstance(self.cond, (BinaryExpr, TernaryExpr)):
             cond_src = f'({cond_src})'
@@ -392,6 +474,7 @@ class CommaExpr(Expr):
     exprs: List[Expr]
 
     def to_source(self) -> str:
+        """输出逗号表达式，常用于打包前置副作用。"""
         return '(' + ', '.join(e.to_source() for e in self.exprs) + ')'
 
 @dataclass
@@ -399,6 +482,7 @@ class ArrayExpr(Expr):
     elements: List[Expr]
 
     def to_source(self) -> str:
+        """输出数组字面量。"""
         if not self.elements:
             return '[]'
         return '[' + ', '.join(e.to_source() for e in self.elements) + ']'
@@ -408,6 +492,7 @@ class DictExpr(Expr):
     items: List[Tuple[Expr, Expr]]
 
     def to_source(self) -> str:
+        """输出 TJS2 字典字面量 `%[...]`。"""
         if not self.items:
             return '%[]'
         pairs = []
@@ -422,6 +507,7 @@ class DeleteExpr(Expr):
     target: Expr
 
     def to_source(self) -> str:
+        """输出 `delete` 表达式。"""
         return f'delete {self.target.to_source()}'
 
 @dataclass
@@ -429,6 +515,7 @@ class TypeofExpr(Expr):
     target: Expr
 
     def to_source(self) -> str:
+        """输出 `typeof` 表达式。"""
         target_src = self.target.to_source()
         if isinstance(self.target, (BinaryExpr, TernaryExpr, InContextOfExpr, AssignExpr)):
             target_src = f'({target_src})'
@@ -439,6 +526,7 @@ class IsValidExpr(Expr):
     target: Expr
 
     def to_source(self) -> str:
+        """输出 `isvalid` 检查表达式。"""
         target_src = self.target.to_source()
         if isinstance(self.target, (BinaryExpr, TernaryExpr, AssignExpr, InContextOfExpr, InstanceofExpr, CommaExpr)):
             target_src = f'({target_src})'
@@ -450,6 +538,7 @@ class InstanceofExpr(Expr):
     right: Expr
 
     def to_source(self) -> str:
+        """输出 `instanceof` 表达式。"""
         left_src = self.left.to_source()
         right_src = self.right.to_source()
         if isinstance(self.left, (TernaryExpr, AssignExpr, InContextOfExpr, CommaExpr)):
@@ -464,6 +553,7 @@ class InContextOfExpr(Expr):
     context: Expr
 
     def to_source(self) -> str:
+        """输出 `incontextof` 表达式。"""
         func_src = self.func.to_source()
         ctx_src = self.context.to_source()
         if isinstance(self.func, (BinaryExpr, TernaryExpr, AssignExpr, CommaExpr)):
@@ -478,9 +568,12 @@ class SwapExpr(Expr):
     right: Expr
 
     def to_source(self) -> str:
+        """输出 TJS2 的交换表达式 `<->`。"""
         return f'{self.left.to_source()} <-> {self.right.to_source()}'
 
 def _expr_has_side_effect(expr):
+    """保守判断表达式是否存在副作用。"""
+    # 这里只做“宁可错杀也不漏判”的保守判断，服务于延迟输出和重排安全性。
     if isinstance(expr, (CallExpr, MethodCallExpr, AssignExpr, DeleteExpr, SwapExpr)):
         return True
     if isinstance(expr, BinaryExpr):
@@ -500,6 +593,7 @@ def _expr_has_side_effect(expr):
 class Stmt(ABC):
     @abstractmethod
     def to_source(self, indent: int = 0) -> str:
+        """按给定缩进把语句节点还原成源码。"""
         pass
 
 @dataclass
@@ -507,6 +601,7 @@ class ExprStmt(Stmt):
     expr: Expr
 
     def to_source(self, indent: int = 0) -> str:
+        """输出以表达式为主体的语句。"""
         return '    ' * indent + self.expr.to_source() + ';'
 
 @dataclass
@@ -515,6 +610,7 @@ class VarDeclStmt(Stmt):
     value: Optional[Expr] = None
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `var` 声明，可选带初始化值。"""
         prefix = '    ' * indent + f'var {self.name}'
         if self.value is not None:
             return prefix + f' = {self.value.to_source()};'
@@ -525,6 +621,7 @@ class ReturnStmt(Stmt):
     value: Optional[Expr] = None
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `return` 语句。"""
         prefix = '    ' * indent + 'return'
         if self.value is not None:
             return prefix + f' {self.value.to_source()};'
@@ -535,6 +632,7 @@ class ThrowStmt(Stmt):
     value: Expr
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `throw` 语句。"""
         return '    ' * indent + f'throw {self.value.to_source()};'
 
 @dataclass
@@ -544,6 +642,7 @@ class IfStmt(Stmt):
     else_body: List[Stmt] = field(default_factory=list)
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `if/else`，只有一条 `else if` 时会尽量压成链式。"""
         prefix = '    ' * indent
         lines = [f'{prefix}if ({self.condition.to_source()}) {{']
         for stmt in self.then_body:
@@ -564,6 +663,7 @@ class WhileStmt(Stmt):
     body: List[Stmt]
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `while` 循环。"""
         prefix = '    ' * indent
         lines = [f'{prefix}while ({self.condition.to_source()}) {{']
         for stmt in self.body:
@@ -577,6 +677,7 @@ class DoWhileStmt(Stmt):
     body: List[Stmt]
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `do ... while` 循环。"""
         prefix = '    ' * indent
         lines = [f'{prefix}do {{']
         for stmt in self.body:
@@ -592,6 +693,7 @@ class ForStmt(Stmt):
     body: List[Stmt]
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `for(init; cond; update)` 循环。"""
         prefix = '    ' * indent
         if isinstance(self.init, VarDeclStmt):
             init_src = self.init.to_source(0).rstrip(';')
@@ -619,6 +721,7 @@ class TryStmt(Stmt):
     catch_body: List[Stmt]
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `try/catch` 语句。"""
         prefix = '    ' * indent
         lines = [f'{prefix}try {{']
         for stmt in self.try_body:
@@ -635,6 +738,7 @@ class _WithMarkerStmt(Stmt):
     level: int = 0
 
     def to_source(self, indent: int = 0) -> str:
+        """内部占位语句，仅用于 with 结构化过程，不直接输出。"""
         return ''
 
 @dataclass
@@ -644,6 +748,7 @@ class WithStmt(Stmt):
     level: int = 0
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `with` 语句。"""
         prefix = '    ' * indent
         lines = [f'{prefix}with ({self.expr.to_source()}) {{']
         for stmt in self.body:
@@ -654,11 +759,13 @@ class WithStmt(Stmt):
 @dataclass
 class BreakStmt(Stmt):
     def to_source(self, indent: int = 0) -> str:
+        """输出 `break`。"""
         return '    ' * indent + 'break;'
 
 @dataclass
 class ContinueStmt(Stmt):
     def to_source(self, indent: int = 0) -> str:
+        """输出 `continue`。"""
         return '    ' * indent + 'continue;'
 
 @dataclass
@@ -667,6 +774,7 @@ class SwitchStmt(Stmt):
     cases: List[Tuple[Optional[Expr], List[Stmt]]]
 
     def to_source(self, indent: int = 0) -> str:
+        """输出 `switch/case/default` 结构。"""
         prefix = '    ' * indent
         case_prefix = '    ' * (indent + 1)
         lines = [f'{prefix}switch ({self.value.to_source()}) {{']
@@ -686,12 +794,21 @@ class FuncDeclStmt(Stmt):
     name: str = ''
 
     def to_source(self, indent=0) -> str:
+        """把已经组装好的函数源码按缩进原样嵌入。"""
         prefix = '    ' * indent
         return '\n'.join(prefix + line for line in self.source_text.split('\n'))
 
 class BytecodeLoader:
+    """TJS2 字节码文件加载器。
+
+    文件结构大致可理解为：
+    - 文件头 `TJS2100\\0`
+    - `DATA` 段：各种常量表
+    - `OBJS` 段：代码对象列表
+    """
 
     def __init__(self, data: bytes):
+        """初始化原始字节流和各类常量池容器。"""
         self.data = data
         self.pos = 0
         self.byte_array: List[int] = []
@@ -705,46 +822,59 @@ class BytecodeLoader:
         self.toplevel: int = -1
 
     def read_i8(self) -> int:
+        """按小端读取一个有符号 8 位整数。"""
         val = struct.unpack_from('<b', self.data, self.pos)[0]
         self.pos += 1
         return val
 
     def read_u8(self) -> int:
+        """按小端读取一个无符号 8 位整数。"""
         val = self.data[self.pos]
         self.pos += 1
         return val
 
     def read_i16(self) -> int:
+        """按小端读取一个有符号 16 位整数。"""
         val = struct.unpack_from('<h', self.data, self.pos)[0]
         self.pos += 2
         return val
 
     def read_u16(self) -> int:
+        """按小端读取一个无符号 16 位整数。"""
         val = struct.unpack_from('<H', self.data, self.pos)[0]
         self.pos += 2
         return val
 
     def read_i32(self) -> int:
+        """按小端读取一个有符号 32 位整数。"""
         val = struct.unpack_from('<i', self.data, self.pos)[0]
         self.pos += 4
         return val
 
     def read_u32(self) -> int:
+        """按小端读取一个无符号 32 位整数。"""
         val = struct.unpack_from('<I', self.data, self.pos)[0]
         self.pos += 4
         return val
 
     def read_i64(self) -> int:
+        """按小端读取一个有符号 64 位整数。"""
         val = struct.unpack_from('<q', self.data, self.pos)[0]
         self.pos += 8
         return val
 
     def read_f64(self) -> float:
+        """按小端读取一个双精度浮点数。"""
         val = struct.unpack_from('<d', self.data, self.pos)[0]
         self.pos += 8
         return val
 
     def load(self) -> bool:
+        """解析整个 TJS2 文件。
+
+        这里只做结构合法性检查与基础解析，不做反编译。任何越界或格式异常
+        都会被捕获并返回 `False`，让调用方按“非法字节码”处理。
+        """
         try:
             if self.data[0:8] != b'TJS2100\x00':
                 return False
@@ -769,10 +899,16 @@ class BytecodeLoader:
             return False
 
     def _read_data_area(self):
+        """读取 DATA 段中的所有常量池。
+
+        TJS2 会把 byte / short / int / long / double / string / octet
+        分开放置。字符串与 octet 之后还要按 4 字节对齐。
+        """
         count = self.read_u32()
         if count > 0:
             for _ in range(count):
                 self.byte_array.append(self.read_i8())
+            # byte 数组结束后补齐到 4 字节边界。
             padding = (4 - (count % 4)) % 4
             self.pos += padding
 
@@ -806,6 +942,7 @@ class BytecodeLoader:
                 s = f'<raw:{chars}>'
             self.string_array.append(s)
             if length % 2:
+                # UTF-16 code unit 数量为奇数时，再补 2 字节保持对齐。
                 self.pos += 2
 
         count = self.read_u32()
@@ -815,6 +952,7 @@ class BytecodeLoader:
             self.pos += ((length + 3) // 4) * 4
 
     def _read_objects(self):
+        """读取 OBJS 段中的所有代码对象。"""
         self.toplevel = self.read_i32()
         obj_count = self.read_u32()
 
@@ -840,6 +978,7 @@ class BytecodeLoader:
             src_pos_count = self.read_u32()
             source_positions = []
             if src_pos_count > 0:
+                # 这里保存“字节码地址 -> 源码位置”的映射，便于未来调试或更细粒度恢复。
                 code_positions = [self.read_u32() for _ in range(src_pos_count)]
                 source_pos = [self.read_u32() for _ in range(src_pos_count)]
                 source_positions = list(zip(code_positions, source_pos))
@@ -884,6 +1023,7 @@ class BytecodeLoader:
             ))
 
     def _resolve_data(self, dtype: int, index: int, current_obj: int) -> Any:
+        """把数据表条目解析成 Python 侧更容易处理的值。"""
         if dtype == DataType.VOID:
             return None
         elif dtype == DataType.OBJECT:
@@ -907,6 +1047,20 @@ class BytecodeLoader:
         return ('unknown', dtype, index)
 
 def get_instruction_size(code: List[int], pos: int) -> int:
+    """根据 opcode 和操作数编码规则推断一条指令的长度。
+
+    TJS2 指令不是定长的，这一步是反汇编/建 CFG 的基础。
+
+    典型例子：
+    - `NOP` / `RET` 这类无操作数指令长度为 1
+    - `CONST r, k` 一般长度为 3
+    - `CALL` / `CALLD` / `CALLI` 会根据参数个数继续增长
+
+    特别是调用指令：
+    - `argc >= 0` 表示后面直接跟 argc 个参数寄存器
+    - `argc == -1` 常表示参数被折叠存放，需要按特殊约定解释
+    - `argc == -2` 表示“真实参数个数”还会再额外跟一个字段
+    """
     if pos >= len(code):
         return 1
 
@@ -933,6 +1087,11 @@ def get_instruction_size(code: List[int], pos: int) -> int:
                        VM.SAR, VM.SAL, VM.SR, VM.ADD, VM.SUB,
                        VM.MOD, VM.DIV, VM.IDIV, VM.MUL]
     for base_op in binary_ops_base:
+        # 这组运算码按固定模式成簇排列：
+        #   base      : 寄存器-寄存器/立即值运算
+        #   base + 1  : 点属性变体（PD）
+        #   base + 2  : 索引属性变体（PI）
+        #   base + 3  : 其他属性写回变体（P）
         if op == base_op:
             return 3
         elif op == base_op + 1:
@@ -977,6 +1136,7 @@ def get_instruction_size(code: List[int], pos: int) -> int:
     return 1
 
 def decode_instructions(code: List[int]) -> List[Instruction]:
+    """把原始 code 数组切分成结构化指令列表。"""
     instructions = []
     pos = 0
     while pos < len(code):
@@ -988,8 +1148,19 @@ def decode_instructions(code: List[int]) -> List[Instruction]:
     return instructions
 
 class Decompiler:
+    """线性反编译器基类。
+
+    这个类负责维护：
+    - 当前寄存器值到高层表达式的映射 `regs`
+    - 寄存器到变量名的映射 `local_vars`
+    - 条件标志位 `flag`
+    - 尚未实体化的数组/字典构造缓存
+
+    CFG 结构化版本会在此基础上进一步恢复更自然的控制流。
+    """
 
     def __init__(self, loader: BytecodeLoader):
+        """初始化一次反编译所需的全局状态。"""
         self.loader = loader
         self.current_obj: Optional[CodeObject] = None
         self.regs: Dict[int, Expr] = {}
@@ -1005,8 +1176,10 @@ class Decompiler:
         self.for_loop_enabled: bool = True
 
     def decompile(self) -> str:
+        """反编译整个文件中的所有对象，并拼接成最终源码文本。"""
         lines = []
 
+        # 先建立类 -> 子对象的映射，便于后续把类方法/属性重新放回类体内。
         self._class_children = {}
         class_indices = set()
         for obj in self.loader.objects:
@@ -1034,6 +1207,8 @@ class Decompiler:
                 child_idx_set = {c.index for c in children}
                 for di, d in enumerate(parent_obj.data):
                     if isinstance(d, tuple) and len(d) == 2 and d[0] == 'inter_object' and d[1] in child_idx_set:
+                        # 某些子函数/子类会在父函数开头以内联常量方式注册，
+                        # 这里把它们标记出来，稍后按更接近源码的顺序输出。
                         self._func_children_at_top.add(d[1])
                     else:
                         break
@@ -1083,6 +1258,11 @@ class Decompiler:
                         if j < len(instrs) and instrs[j].op == VM.CHGTHIS:
                             j += 1
                         if j < len(instrs) and instrs[j].op == VM.SPDS and instrs[j].operands[0] == -1:
+                            # 这类模式通常对应：
+                            #   const rX, <child object>
+                            #   chgthis ...
+                            #   spds -1, "Name"
+                            # 也就是把子对象直接注册到顶层 `this.Name` 上。
                             if child_idx not in top_level_children_at_top:
                                 top_level_children_at_top.add(child_idx)
                                 top_level_children_at_top_ordered.append(child_idx)
@@ -1158,6 +1338,7 @@ class Decompiler:
         return '\n'.join(lines)
 
     def _decompile_object_definition(self, obj: CodeObject) -> str:
+        """按对象上下文把 CodeObject 分派到相应的反编译入口。"""
         if obj.context_type == ContextType.FUNCTION:
             return self._decompile_function(obj)
         elif obj.context_type == ContextType.EXPR_FUNCTION:
@@ -1170,6 +1351,7 @@ class Decompiler:
             return self._decompile_function(obj)
 
     def _should_emit_spds_ampersand(self, r1: int) -> bool:
+        """判断 `SPDS` 是否应恢复成带 `&` 的属性引用写法。"""
         if r1 != -1:
             return True
         ctx = self.current_obj.context_type
@@ -1177,6 +1359,7 @@ class Decompiler:
 
     @staticmethod
     def _contains_with_this(node, exclude_level: int = 0) -> bool:
+        """递归检查语法树中是否仍包含某层 `with` 作用域的 `this` 代理。"""
         if isinstance(node, WithThisExpr):
             return True
         if isinstance(node, WithStmt) and exclude_level > 0:
@@ -1195,9 +1378,13 @@ class Decompiler:
         return False
 
     def _wrap_with_blocks(self, stmts: List[Stmt]) -> List[Stmt]:
+        """把线性翻译阶段记下的 with marker 回包成真正的 `WithStmt`。"""
         if not stmts:
             return stmts
 
+        # 第一阶段线性翻译时，`with (...)` 先记成一个哨兵 `_WithMarkerStmt`，
+        # 这里只做第二阶段“回包裹”：把 marker 后面实际依赖 with 作用域的
+        # 语句重新收拢成 `WithStmt`。
         marker_indices = [(i, s) for i, s in enumerate(stmts)
                           if isinstance(s, _WithMarkerStmt)]
         if not marker_indices:
@@ -1210,6 +1397,7 @@ class Decompiler:
 
             last_with_idx = -1
             for j, stmt in enumerate(candidates):
+                # 只要语句树里还引用着 `WithThisExpr`，就说明它仍受当前 with 影响。
                 if self._contains_with_this(stmt, exclude_level=level):
                     last_with_idx = j
 
@@ -1226,6 +1414,7 @@ class Decompiler:
         return result
 
     def _prepend_context_var_decls(self, obj: CodeObject, stmts: list) -> list:
+        """把上下文变量声明补到语句序列前部。"""
         if self._context_var_names:
             undeclared = [name for name in self._context_var_names
                          if name not in self.declared_vars]
@@ -1236,10 +1425,12 @@ class Decompiler:
         return stmts
 
     def _hoist_cross_scope_vars(self, stmts: list) -> list:
+        """提升跨分支/跨块继续使用的变量声明。"""
         import re
         LOCAL_RE = re.compile(r'\blocal\d+(?:_\d+)?\b')
 
         def _get_child_bodies(stmt):
+            # 统一枚举“拥有子语句块”的语法节点，便于递归扫描声明/引用。
             if isinstance(stmt, IfStmt):
                 return [stmt.then_body, stmt.else_body]
             if isinstance(stmt, (WhileStmt, DoWhileStmt)):
@@ -1255,6 +1446,7 @@ class Decompiler:
             return []
 
         def _all_var_decls(body):
+            # 收集某个语句块内部声明过的变量/函数名。
             names = set()
             for s in body:
                 if isinstance(s, VarDeclStmt):
@@ -1268,6 +1460,7 @@ class Decompiler:
             return names
 
         def _all_var_refs(stmts_list, extra_names=None):
+            # 这里直接把子树转回源码做文本匹配，虽然朴素，但对这个项目足够稳妥。
             src = '\n'.join(s.to_source(0) for s in stmts_list)
             refs = set(LOCAL_RE.findall(src))
             if extra_names:
@@ -1277,6 +1470,12 @@ class Decompiler:
             return refs
 
         def _convert_decl_to_assign(stmt, names):
+            # 一旦某个名字需要提升，就把块内声明改写成普通赋值。
+            # 例如：
+            #   if (...) { var x = 1; }
+            # 变成：
+            #   var x;
+            #   if (...) { x = 1; }
             if isinstance(stmt, VarDeclStmt) and stmt.name in names:
                 if stmt.value:
                     return ExprStmt(AssignExpr(VarExpr(stmt.name), stmt.value))
@@ -1303,6 +1502,7 @@ class Decompiler:
 
         for stmt in stmts:
             for body in _get_child_bodies(stmt):
+                # 先递归处理更深层，避免外层提升时遗漏内层嵌套引用。
                 body[:] = self._hoist_cross_scope_vars(body)
 
         hoisted = set()
@@ -1317,9 +1517,11 @@ class Decompiler:
                 continue
             non_local_names = {n for n in inner_decls if not LOCAL_RE.fullmatch(n)}
             if i + 1 < len(stmts):
+                # 情况 1：变量在当前分支里声明，却在分支之后继续被引用。
                 remaining_refs = _all_var_refs(stmts[i+1:], extra_names=non_local_names)
                 hoisted.update(inner_decls & remaining_refs)
             if len(bodies) >= 2:
+                # 情况 2：变量在一个分支里声明，却在另一个兄弟分支里使用。
                 for bi, body in enumerate(bodies):
                     decls_here = _all_var_decls(body)
                     non_local_here = {n for n in decls_here if not LOCAL_RE.fullmatch(n)}
@@ -1336,6 +1538,7 @@ class Decompiler:
         hoisted_decls = [VarDeclStmt(name) for name in sorted(hoisted)]
         insert_pos = 0
         for s in stmts:
+            # 参数默认值恢复常生成若干前置保护 if，把提升声明插在它们后面可读性更好。
             if (isinstance(s, IfStmt) and not s.else_body
                     and len(s.then_body) == 1
                     and isinstance(s.then_body[0], ExprStmt)
@@ -1349,12 +1552,15 @@ class Decompiler:
         return new_stmts
 
     def _decompile_function(self, obj: CodeObject) -> str:
+        """反编译普通具名函数对象。"""
         self._reset_state()
         self.current_obj = obj
 
         args = self._build_args(obj)
         args_str = ', '.join(args)
 
+        # TJS2 中参数会映射到负寄存器，这里预先把“参数寄存器 -> 参数名”建立好，
+        # 后面翻译指令时才能直接把 `-3/-4/...` 输出成可读变量名。
         for i, arg in enumerate(args):
             if arg == '*':
                 continue
@@ -1372,6 +1578,7 @@ class Decompiler:
 
         stmts = self._decompile_object(obj)
 
+        # 这几步都是把“语义正确但偏底层”的语句，进一步整理成人类更熟悉的源码形态。
         stmts = self._wrap_with_blocks(stmts)
 
         stmts = self._hoist_cross_scope_vars(stmts)
@@ -1399,6 +1606,8 @@ class Decompiler:
             return result
 
         if top_children:
+            # 有些子函数/子类在原字节码里就是“函数体开头先注册定义”，
+            # 提前输出会更接近原始书写顺序。
             lines.extend(_emit_children(top_children))
             lines.append('')
 
@@ -1406,6 +1615,7 @@ class Decompiler:
             lines.append(stmt.to_source(1))
 
         if bottom_children:
+            # 剩余子对象则落在函数主体之后，避免打断主流程阅读。
             lines.extend(_emit_children(bottom_children))
             lines.append('')
 
@@ -1414,12 +1624,14 @@ class Decompiler:
         return '\n'.join(lines)
 
     def _decompile_lambda(self, obj: CodeObject) -> str:
+        """反编译表达式函数/lambda，并尽量输出紧凑形式。"""
         self._reset_state()
         self.current_obj = obj
 
         args = self._build_args(obj)
         args_str = ', '.join(args)
 
+        # lambda 和普通 function 在参数寄存器初始化上是同一套规则。
         for i, arg in enumerate(args):
             if arg == '*':
                 continue
@@ -1444,6 +1656,7 @@ class Decompiler:
         stmts = self._prepend_context_var_decls(obj, stmts)
 
         if len(stmts) == 1 and isinstance(stmts[0], ReturnStmt):
+            # 单表达式 lambda 尽量压回紧凑形式，提升可读性。
             ret = stmts[0]
             if ret.value is not None:
                 return f'function({args_str}) {{ return {ret.value.to_source()}; }}'
@@ -1457,6 +1670,10 @@ class Decompiler:
         return '\n'.join(lines)
 
     def _decompile_anon_func(self, obj: CodeObject) -> AnonFuncExpr:
+        """递归反编译匿名函数对象，并在结束后恢复外层现场。"""
+        # 这里不是“speculative 试跑”，而是真正切进另一个 CodeObject 递归反编译。
+        # 因此要手工保存比 `_save_speculative_state()` 更多的宿主现场：
+        # 当前对象、with 范围、循环栈、register-split 命名表、延迟输出队列等。
         saved_regs = dict(self.regs)
         saved_local_vars = dict(self.local_vars)
         saved_declared = set(self.declared_vars)
@@ -1571,6 +1788,9 @@ class Decompiler:
         return AnonFuncExpr(args, body)
 
     def _decompile_inline_func_decl(self, child_obj: 'CodeObject') -> str:
+        """反编译适合在当前位置直接展开的子函数声明。"""
+        # 与匿名函数类似，内联函数声明的反编译会暂时借用同一个 decompiler 实例，
+        # 所以也需要做一份“重型现场保存”，避免子对象污染父对象翻译状态。
         saved_regs = dict(self.regs)
         saved_local_vars = dict(self.local_vars)
         saved_declared = set(self.declared_vars)
@@ -1650,6 +1870,7 @@ class Decompiler:
         return result
 
     def _decompile_class(self, obj: CodeObject, indent: int = 0) -> str:
+        """反编译 class 对象及其子成员。"""
         prefix = '    ' * indent
         inner = '    ' * (indent + 1)
 
@@ -1734,6 +1955,7 @@ class Decompiler:
         return '\n'.join(lines)
 
     def _decompile_property(self, obj: CodeObject, indent: int = 0) -> str:
+        """反编译 property 对象，分别生成 getter 与 setter。"""
         prefix = '    ' * indent
         lines = [f'{prefix}property {obj.name} {{']
 
@@ -1771,6 +1993,7 @@ class Decompiler:
         return '\n'.join(lines)
 
     def _build_args(self, obj: CodeObject) -> List[str]:
+        """根据对象元信息恢复函数参数列表。"""
         args = []
         for i in range(obj.func_decl_arg_count):
             args.append(f'arg{i}')
@@ -1787,12 +2010,32 @@ class Decompiler:
         return args
 
     def _reset_state(self):
+        """重置一次对象级反编译所需的全部运行状态。"""
         self.regs = {}
         self.local_vars = {}
         self.var_counter = 0
+        # 条件恢复链的核心状态：
+        # - `flag`         : 最近一次比较/布尔测试所对应的“原始条件表达式”
+        # - `flag_negated` : 这个条件当前是否被逻辑翻转过
+        #
+        # 之所以拆成两个量，而不是每次都立刻生成 `!expr`，是因为字节码里常见：
+        #   CEQ a, b
+        #   NF
+        #   JF ...
+        # 这种连续翻转。把“是否取反”单独存一位，后续 `SETF/JF/JNF` 才能更稳地组合。
         self.flag = None
         self.flag_negated = False
         self.declared_vars = set()
+        # 这三者配合实现“字面量延迟实体化”：
+        # - `pending_arrays[reg]`   : 记录某个 `new Array()` 寄存器后续累计到的元素
+        # - `pending_dicts[reg]`    : 记录某个 `new Dictionary()` 寄存器后续累计到的键值对
+        # - `pending_counters`      : 记录“只是数组追加计数器”的寄存器，避免把它们误翻成普通 ++
+        #
+        # 之所以不在看到 `NEW Array/Dictionary` 时立刻输出 `new Array()`，
+        # 是因为 TJS2 更常见的字节码模式其实对应源码字面量：
+        #   var a = [];
+        #   a.add(x)      -> 字节码里常变成一串对同一寄存器的 SPI
+        #   var d = %[];
         self.pending_arrays = {}
         self.pending_dicts = {}
         self.pending_counters = set()
@@ -1802,14 +2045,32 @@ class Decompiler:
         self._with_active_ranges = []
         self._in_with = False
         self._parent_in_with = False
+        # `_pending_spie` / `_pre_stmts` 是“延迟输出副作用语句”机制：
+        # - `_pending_spie`：当前暂挂的一条赋值/写属性语句，先不急着落地
+        # - `_pre_stmts`：已经确认不能再内嵌进表达式、需要在下一条正式语句前补出的前置语句
+        #
+        # 典型原因是 TJS2 常把：
+        #   obj.x = new Foo();
+        #   obj.x.bar();
+        # 编成“先做赋值，再继续用右值寄存器”的形式。若立刻输出赋值语句，
+        # 后面就很难再恢复成链式表达式；因此这里先挂起，等看一眼后文再决定。
         self._pending_spie = None
         self._pre_stmts = []
+        # `_current_addr` 表示“当前正在翻译/推测”的字节码地址。
+        # `_get_local_name()` 会拿它去查 `(addr, reg) -> component`，
+        # 从而把同一个负寄存器槽在不同生命期映射成不同变量名。
         self._current_addr = 0
         self._reg_splits = None
         self._split_var_names = {}
         self._switch_break_stack = []
         self._for_loop_update_addr = None
         self._for_loop_skip_tail_bid = None
+        # “副作用表达式保守化”链路的三类状态：
+        # - `_side_effect_multi_read_addrs`：某条 CALL/NEW 等结果若既有副作用又会被多次读取，
+        #   就不适合直接内联成表达式，应先落到临时变量。
+        # - `_callexpr_temp_cp_addrs`：某些 `CP local, call_result` 需要强制走临时变量，
+        #   避免调用表达式被重复求值或在错误位置具名化。
+        # - `_deferred_cp_stmts`：某些局部赋值语句需要延后到 alias / 控制流更稳定后再输出。
         self._side_effect_multi_read_addrs = set()
         self._cp_side_effect_alias_addrs = set()
         self._cp_alias_defer_addrs = {}
@@ -1824,6 +2085,18 @@ class Decompiler:
         self.loop_context_stack = []
 
     def _save_speculative_state(self) -> dict:
+        """保存“可试跑、可回滚”的最小反编译状态快照。
+
+        用途通常是：
+        1. 先假设某段字节码可以恢复成更高级结构（如三元表达式）
+        2. 试着翻译若干条指令
+        3. 如果发现目标寄存器不一致、出现副作用或结构不匹配，就整体回滚
+
+        这里保留的是“试翻译会污染”的那部分状态，而不是完整对象级现场。
+        像匿名函数/内联函数切换那种跨对象递归，会用更重的手工保存方案。
+        """
+        # 某些恢复逻辑会先“试着翻译一遍分支/表达式”，如果失败再回滚。
+        # `_current_addr` 也必须一起快照，否则回滚后局部变量 component 的判定会串位。
         return {
             'regs': dict(self.regs),
             'flag': self.flag,
@@ -1833,15 +2106,20 @@ class Decompiler:
             'var_counter': self.var_counter,
             'pending_dicts': dict(self.pending_dicts),
             'pending_arrays': dict(self.pending_arrays),
+            # pending 字面量草稿也属于“试跑会污染的状态”，
+            # 否则一次失败的 speculative 翻译可能提前把数组/字典实体化。
             'pending_counters': set(self.pending_counters),
             '_pending_spie': self._pending_spie,
             '_pre_stmts': list(self._pre_stmts),
             '_current_addr': self._current_addr,
             '_prev_instruction': self._prev_instruction,
+            # 试跑期间若把 CP 延后队列污染了，回滚时也必须恢复，
+            # 否则失败分支里的赋值会“漏”到正式输出路径上。
             '_deferred_cp_stmts': list(self._deferred_cp_stmts),
         }
 
     def _restore_speculative_state(self, snapshot: dict):
+        """恢复 `_save_speculative_state()` 保存的轻量级试跑现场。"""
         self.regs = dict(snapshot['regs'])
         self.flag = snapshot['flag']
         self.flag_negated = snapshot['flag_negated']
@@ -1853,11 +2131,13 @@ class Decompiler:
         self.pending_counters = set(snapshot['pending_counters'])
         self._pending_spie = snapshot['_pending_spie']
         self._pre_stmts = list(snapshot['_pre_stmts'])
+        # 地址上下文与寄存器/flag 状态一样，都是 speculative 解释的一部分。
         self._current_addr = snapshot['_current_addr']
         self._prev_instruction = snapshot['_prev_instruction']
         self._deferred_cp_stmts = list(snapshot['_deferred_cp_stmts'])
 
     def _detect_with_blocks(self, instructions: List[Instruction]):
+        """预扫描 with 入口、调用临时变量化和副作用多读等辅助标记。"""
         self._with_cp_addrs = set()
 
         if not instructions:
@@ -2002,6 +2282,14 @@ class Decompiler:
                                   VM.CALL, VM.CALLD, VM.CALLI, VM.NEW):
                         break
             if use_count >= 2:
+                # 例：
+                #   CALL r1, ...
+                #   CP   r2, r1
+                #   GPD  r3, r2, "x"
+                #   CALLD 0, r2, "m", ...
+                #
+                # 这里若直接把 `r2` 当成“可内联的调用表达式”，后续两次使用就会看起来像
+                # 重复执行同一个有副作用的调用。因此把这条 CP 标成“必须先起临时变量”。
                 self._callexpr_temp_cp_addrs.add(instr.addr)
 
         _loop_ranges = []
@@ -2073,6 +2361,8 @@ class Decompiler:
                     ):
                         break
             if read_count >= 2:
+                # 第一层筛选：调用/构造结果在一个局部线性片段里被读取了至少两次。
+                # 对有副作用的表达式来说，这通常意味着不该直接内联。
                 if instr.op != VM.NEW and _addr_in_loop_condition(instr.addr):
                     continue
                 skip = False
@@ -2140,6 +2430,10 @@ class Decompiler:
                                     skip = True
                             break
                 if not skip:
+                    # 通过筛选后，后续翻译时会优先输出：
+                    #   var _tempX = call(...);
+                    # 再让后面的多次读取都指向 `_tempX`，
+                    # 从而避免把一次调用错误地复制成多次求值。
                     self._side_effect_multi_read_addrs.add(instr.addr)
 
         for i, instr in enumerate(instructions):
@@ -2173,6 +2467,8 @@ class Decompiler:
             threshold = 4 if instr.op == VM.NEW else 2
             if gpd_count >= threshold and not has_cp_to_local and not has_spd_value_write:
                 if not _addr_in_loop_condition(instr.addr):
+                    # 第二层补充规则：即使不是显式“两次读取”，若某个调用结果被长链式属性访问
+                    # 反复向下钻取，也更安全地先提成临时变量。
                     self._side_effect_multi_read_addrs.add(instr.addr)
 
         _DEAD_GPD_OVERWRITE_OPS = frozenset((
@@ -2281,6 +2577,19 @@ class Decompiler:
                 self._cp_side_effect_alias_addrs.add(instr.addr)
 
     def _detect_cp_alias_overwrites(self, instructions: List[Instruction]):
+        """识别 `CP` 形成的寄存器别名何时会被后续写入打断。
+
+        典型场景：
+            CP r1, local0
+            ...
+            CP local0, r2
+
+        第一条之后，反编译器很容易把 `r1` 当成 `local0` 的别名来传播。
+        但如果后面 `local0` 被覆盖，而 `r1` 旧值还会继续被使用，那么两者
+        就不能再被视为“永远同值”。这里会记录：
+        - 在 CP 点就必须拍快照的地址
+        - 在某个覆盖点之后应延迟/停止别名传播的地址
+        """
         self._cp_alias_defer_addrs = {}
         self._cp_alias_snapshot_addrs = {}
 
@@ -2302,6 +2611,8 @@ class Decompiler:
         }
 
         def _get_read_regs_local(instr):
+            # 这里只做“够用即可”的局部读取分析，目标是判断 alias 的目标正寄存器
+            # 在 overwrite 之后是否仍会被消费，而不是完整复刻 _get_def_use_regs。
             op = instr.op
             ops = instr.operands
             if not ops:
@@ -2352,6 +2663,8 @@ class Decompiler:
         }
 
         def _writes_to(instr, reg):
+            # 判断一条指令是否真正改写了某个寄存器，而不是仅仅把该数值
+            # 当作 data index / jump offset / 参数个数来使用。
             if not instr.operands:
                 return False
             if instr.operands[0] != reg:
@@ -2365,6 +2678,8 @@ class Decompiler:
             if instr.op == VM.CP and len(instr.operands) >= 2:
                 pos_reg, neg_reg = instr.operands[0], instr.operands[1]
                 if pos_reg > 0 and neg_reg < -2:
+                    # 只跟踪 “正寄存器 <- 负寄存器” 这一类 alias。
+                    # 它们最容易在源码恢复阶段被误判成“同一个局部变量”。
                     if instr.addr not in self._with_cp_addrs:
                         alias_candidates.append((i, pos_reg, neg_reg, instr.addr))
 
@@ -2376,6 +2691,7 @@ class Decompiler:
                 nxt = instructions[j]
                 if nxt.op == VM.CP and len(nxt.operands) >= 2:
                     if nxt.operands[0] == neg_reg:
+                        # `CP localX, ...` 本质上也是一次对 localX 的覆写。
                         overwrite_idx = j
                         overwrite_addr = nxt.addr
                         break
@@ -2384,8 +2700,10 @@ class Decompiler:
                     overwrite_addr = nxt.addr
                     break
                 if _writes_to(nxt, pos_reg):
+                    # alias 自己先被改写了，则这条 CP 的跟踪可以在此终止。
                     break
                 if nxt.op == VM.JMP and nxt.operands[0] < 0:
+                    # 碰到向后跳的循环边就收手，避免把跨迭代写入误判成同一条线性生命期。
                     break
                 if nxt.op == VM.RET or nxt.op == VM.THROW:
                     break
@@ -2415,11 +2733,20 @@ class Decompiler:
                             overwrite_in_branch = True
                             break
                 if overwrite_in_branch:
+                    # 例：
+                    #   CP r1, local0
+                    #   jf L1
+                    #   CP local0, r2
+                    # L1:
+                    #   ... use r1 ...
+                    # 汇合后 r1 代表“旧 local0”，必须在 CP 点冻结其值。
                     self._cp_alias_snapshot_addrs[cp_addr] = (pos_reg, neg_reg)
                 else:
+                    # 线性覆盖则不必立刻拍快照，只需在 overwrite 之后断开别名传播。
                     self._cp_alias_defer_addrs[overwrite_addr] = pos_reg
 
     def _decompile_object(self, obj: CodeObject) -> List[Stmt]:
+        """把单个代码对象的原始字节码翻译成语句列表。"""
         if not obj.code:
             return []
 
@@ -2433,6 +2760,7 @@ class Decompiler:
         return result
 
     def _decompile_instructions(self, instructions: List[Instruction], obj: CodeObject) -> List[Stmt]:
+        """对已解码指令先做控制流分析，再生成结构化源码。"""
         if not instructions:
             return []
 
@@ -2441,6 +2769,7 @@ class Decompiler:
         return self._generate_structured_code(instructions, obj, 0, len(instructions), is_top_level=True)
 
     def _analyze_control_flow(self, instructions: List[Instruction]):
+        """建立跳转目标、回边和循环头等控制流辅助索引。"""
         self.jump_targets = {}
         self.back_edges = set()
         self.loop_headers = {}
@@ -2464,8 +2793,9 @@ class Decompiler:
                 self.loop_headers[back_to] = back_from
 
     def _generate_structured_code(self, instructions: List[Instruction], obj: CodeObject,
-                                    start_idx: int, end_idx: int, is_top_level: bool = False,
-                                    loop_context: Optional[Tuple[int, int, int]] = None) -> List[Stmt]:
+                                  start_idx: int, end_idx: int, is_top_level: bool = False,
+                                  loop_context: Optional[Tuple[int, int, int]] = None) -> List[Stmt]:
+        """把一段线性指令区间尽量恢复为结构化语句序列。"""
         stmts = []
         addr_to_idx = {ins.addr: i for i, ins in enumerate(instructions)}
         i = start_idx
@@ -2481,6 +2811,8 @@ class Decompiler:
                     continue
 
             if instr.op == VM.ENTRY:
+                # 线性结构化模式下先试着吃掉整个 try/catch 区域，
+                # 这样后面的普通语句翻译就不会把异常骨架拆碎。
                 try_result = self._process_try(instructions, obj, i, end_idx, loop_context=loop_context)
                 if try_result:
                     stmts.append(try_result['stmt'])
@@ -2491,6 +2823,7 @@ class Decompiler:
                 target = instr.addr + instr.operands[0]
 
                 if target < instr.addr and target in addr_to_idx:
+                    # 条件分支回跳到更早位置，通常意味着循环相关控制流。
                     current_loop = loop_context or (self.loop_context_stack[-1] if self.loop_context_stack else None)
                     if current_loop and target == current_loop[2]:
                         cond = self._get_condition(False)
@@ -2502,6 +2835,10 @@ class Decompiler:
                             next_jmp = instructions[next_idx]
                             jmp_target = next_jmp.addr + next_jmp.operands[0]
                             if jmp_target >= current_loop[1]:
+                                # 这是“continue 后面紧跟一条跳出循环”的经典编译形态，
+                                # 还原时更像 `if (...) break;`。
+                                # 控制流即将提前离开当前线性序列，挂起赋值必须先落地，
+                                # 否则会被错误地“跨过 break/continue”。
                                 flushed = self._flush_pending_spie()
                                 if flushed:
                                     stmts.append(flushed)
@@ -2519,6 +2856,8 @@ class Decompiler:
                         i += 1
                         continue
                     else:
+                        # 当前块看起来像循环头条件，但还不能立即收束为完整 while；
+                        # 先把条件记下来，交给后续块级逻辑继续判定。
                         cond = self._get_condition(False)
                         loop_cond = cond if instr.op == VM.JF else self._negate_expr(cond)
                         i += 1
@@ -2526,6 +2865,7 @@ class Decompiler:
 
                 sc_result = self._try_process_short_circuit(instructions, obj, i, end_idx, addr_to_idx)
                 if sc_result is not None:
+                    # 短路表达式优先级高于 if，否则 `a && b` 容易被错误拆成语句。
                     i = sc_result
                     continue
 
@@ -2538,6 +2878,7 @@ class Decompiler:
 
                 if_result = self._process_if(instructions, obj, i, end_idx)
                 if if_result:
+                    # 只有前面的 specialized 识别都失败时，才退回普通 if 恢复。
                     if if_result.get('stmt') is not None:
                         stmts.append(if_result['stmt'])
                     i = if_result['next_idx']
@@ -2550,6 +2891,7 @@ class Decompiler:
                 if current_loop:
                     loop_start_addr, loop_exit_addr, continue_target = current_loop
                     if target >= loop_exit_addr:
+                        # `break` 前同理，要先把挂起副作用语句补出来。
                         flushed = self._flush_pending_spie()
                         if flushed:
                             stmts.append(flushed)
@@ -2558,6 +2900,7 @@ class Decompiler:
                         i += 1
                         continue
                     elif target == continue_target:
+                        # `continue` 前也必须冲刷，否则副作用会被错误延后到下一轮。
                         flushed = self._flush_pending_spie()
                         if flushed:
                             stmts.append(flushed)
@@ -2567,6 +2910,7 @@ class Decompiler:
                         continue
 
                 if target < instr.addr:
+                    # 普通回跳一般只是循环骨架的一部分，结构已在上层消费。
                     i += 1
                     continue
                 i += 1
@@ -2574,24 +2918,32 @@ class Decompiler:
 
             swap_result = self._try_detect_swap(instructions, obj, i, end_idx)
             if swap_result:
+                # 把多条寄存器搬运组合识别为交换表达式，可大幅提升可读性。
                 stmts.append(swap_result['stmt'])
                 i = swap_result['next_idx']
                 continue
 
+            # 默认路径：逐条指令翻译成表达式/语句，再把挂起的前置语句一并冲刷出来。
             stmt = self._translate_instruction(instr, obj)
             self._collect_pre_stmts(stmts)
             if stmt:
                 stmts.append(stmt)
                 if self._deferred_cp_stmts:
+                    # 线性语句已经稳定产出后，再把之前延迟的 CP 赋值顺序补回来。
+                    # 这样既保住了 alias/临时变量分析，又不至于丢掉原本应出现的赋值语句。
                     stmts.extend(self._deferred_cp_stmts)
                     self._deferred_cp_stmts = []
             i += 1
 
+        # 到一个线性片段末尾还没被后文消费的挂起赋值，说明已经不可能再内嵌，
+        # 这里统一把它冲刷成独立语句。
         flushed = self._flush_pending_spie()
         if flushed:
             stmts.append(flushed)
 
         if self._deferred_cp_stmts:
+            # 片段结束时若还有 deferred CP，说明它们没有更好的插入时机了，
+            # 这里统一按原顺序落地。
             stmts.extend(self._deferred_cp_stmts)
             self._deferred_cp_stmts = []
 
@@ -2603,6 +2955,7 @@ class Decompiler:
 
     def _process_loop(self, instructions: List[Instruction], obj: CodeObject,
                       start_idx: int, end_idx: int) -> Optional[Dict]:
+        """识别并恢复传统 while / do-while / infinite loop 形态。"""
         loop_start = instructions[start_idx].addr
         loop_end_addr = self.loop_headers.get(loop_start)
 
@@ -2746,6 +3099,7 @@ class Decompiler:
             if back_jump.op == VM.JF:
                 loop_cond = cond
             else:
+                # `JNF` 的“跳转条件”为假，因此源码里的“继续循环条件”要再翻一次。
                 loop_cond = self._negate_expr(cond)
 
             do_while_stmt = DoWhileStmt(loop_cond, body_stmts)
@@ -2755,6 +3109,21 @@ class Decompiler:
 
     def _apply_cond_side_effects(self, cond: Expr, instructions: List['Instruction'],
                                   start_idx: int, end_idx: int) -> Tuple[Expr, Set[int]]:
+        """尝试把条件构造区里的自增/自减副作用并回条件表达式本身。
+
+        例如字节码可能是：
+            TT local0
+            INC local0
+            JF ...
+
+        如果直接线性输出，就会得到：
+            local0;
+            ++local0;
+            if (...)
+
+        这里会尽量恢复成更接近源码语义的：
+            if (++local0)
+        """
         merged_addrs = set()
         for j in range(start_idx, end_idx):
             instr = instructions[j]
@@ -2784,6 +3153,7 @@ class Decompiler:
         return cond, merged_addrs
 
     def _replace_var_in_expr(self, expr: Expr, var_name: str, replacement: Expr) -> Expr:
+        """在表达式树中把指定变量引用替换成另一表达式。"""
         if isinstance(expr, VarExpr) and expr.name == var_name:
             return replacement
         if isinstance(expr, BinaryExpr):
@@ -2801,8 +3171,11 @@ class Decompiler:
 
     def _try_detect_swap(self, instructions: List[Instruction], obj: CodeObject,
                          start_idx: int, end_idx: int) -> Optional[Dict]:
+        """尝试把一小段寄存器搬运模式识别成交换表达式。"""
         saved_addr = self._current_addr
         def _get_local_at(reg, instr):
+            # 这里虽然只是“模式识别期”的预读，但变量名仍要按该指令真实地址来取，
+            # 否则拆分槽位会拿到错误的 component 后缀。
             self._current_addr = instr.addr
             return self._get_local_name(reg)
 
@@ -2821,10 +3194,12 @@ class Decompiler:
                                                  end_idx, _get_local_at, _get_obj_expr)
             return result
         finally:
+            # 预读/窥探结束后要把地址上下文恢复，避免污染外层正式翻译流程。
             self._current_addr = saved_addr
 
     def _try_detect_swap_inner(self, instructions, obj, start_idx, end_idx,
                                _get_local_at, _get_obj_expr):
+        """在不污染外层状态的前提下匹配多种 swap 字节码模板。"""
         if start_idx + 4 <= end_idx:
             i0, i1, i2, i3 = instructions[start_idx:start_idx + 4]
             if (i0.op == VM.GPD and i1.op == VM.GPD and
@@ -2987,6 +3362,11 @@ class Decompiler:
                                     return {'stmt': swap_stmt, 'next_idx': spde2_idx + 1}
 
         if start_idx + 2 < end_idx:
+            # 模板 1：纯局部变量交换
+            #   CP tmp, a
+            #   CP a, b
+            #   CP b, tmp
+            # 这是最标准的“三条 CP 倒手”交换序列，可直接恢复成 `a <-> b`。
             i0, i1, i2 = instructions[start_idx:start_idx + 3]
 
             if i0.op == VM.CP and i1.op == VM.CP and i2.op == VM.CP:
@@ -3005,6 +3385,12 @@ class Decompiler:
                     return {'stmt': swap_stmt, 'next_idx': start_idx + 3}
 
         if start_idx + 3 <= end_idx:
+            # 模板 2：属性 <-> 局部变量
+            #   GPD tmp, obj, "x"
+            #   SPD obj, "x", local
+            #   CP  local, tmp
+            # 高层更接近：
+            #   obj.x <-> local
             i0, i1, i2 = instructions[start_idx:start_idx + 3]
             if (i0.op in (VM.GPD, VM.GPDS) and
                 i1.op in (VM.SPD, VM.SPDE, VM.SPDEH, VM.SPDS) and
@@ -3029,6 +3415,11 @@ class Decompiler:
                     return {'stmt': swap_stmt, 'next_idx': start_idx + 3}
 
         if start_idx + 4 <= end_idx:
+            # 模板 3：局部变量 <-> 属性（顺序与模板 2 相反）
+            #   CP  tmp, local
+            #   GPD r2, obj, "x"
+            #   CP  local, r2
+            #   SPD obj, "x", tmp
             i0, i1, i2, i3 = instructions[start_idx:start_idx + 4]
             if (i0.op == VM.CP and
                 i1.op in (VM.GPD, VM.GPDS) and
@@ -3056,6 +3447,11 @@ class Decompiler:
                     return {'stmt': swap_stmt, 'next_idx': start_idx + 4}
 
         if start_idx + 4 <= end_idx:
+            # 模板 4：同一对象上两个索引属性互换
+            #   GPI r1, obj, idx1
+            #   GPI r2, obj, idx2
+            #   SPI obj, idx1, r2
+            #   SPI obj, idx2, r1
             i0, i1, i2, i3 = instructions[start_idx:start_idx + 4]
             if (i0.op in (VM.GPI, VM.GPIS) and i1.op in (VM.GPI, VM.GPIS) and
                 i2.op in (VM.SPI, VM.SPIE, VM.SPIS) and
@@ -3071,6 +3467,7 @@ class Decompiler:
                     r1 == val4 and r2 == val3):
 
                     def _get_idx_expr(reg, instr):
+                        # 索引寄存器本身也可能是局部槽，因此这里同样要按真实地址取名字。
                         if reg < -2:
                             return VarExpr(_get_local_at(reg, instr))
                         elif reg in self.regs:
@@ -3086,6 +3483,12 @@ class Decompiler:
                     return {'stmt': swap_stmt, 'next_idx': start_idx + 4}
 
         if start_idx + 6 <= end_idx:
+            # 模板 5：同一对象两个索引属性交换，但中间插着若干安全指令。
+            # 这里不再要求严格“四连指令”，而是允许在有限窗口里寻找：
+            #   先读 idx1
+            #   再读 idx2
+            #   写回 idx1 <- old(idx2)
+            #   最后写回 idx2 <- old(idx1)
             i0 = instructions[start_idx]
             if i0.op in (VM.GPI, VM.GPIS):
                 save_r, obj1, idx1_reg = i0.operands[0], i0.operands[1], i0.operands[2]
@@ -3096,6 +3499,7 @@ class Decompiler:
                         if obj2 != obj1:
                             continue
                         save_ok = True
+                        # `save_r` 保存着 old(idx1)，在找到第二次读取之前不能被任何写入覆盖。
                         for k in range(start_idx + 1, j):
                             ik = instructions[k]
                             if ik.operands and ik.operands[0] == save_r:
@@ -3127,6 +3531,7 @@ class Decompiler:
                                     if not save_ok2:
                                         break
                                     def _get_idx_expr10(reg, instr):
+                                        # 与上面的 `_get_idx_expr` 一样，这里只是局部版索引恢复。
                                         if reg < -2:
                                             return VarExpr(_get_local_at(reg, instr))
                                         elif reg in self.regs:
@@ -3147,6 +3552,9 @@ class Decompiler:
                         break
 
         if start_idx + 5 <= end_idx:
+            # 模板 6：局部变量 <-> “对象属性里的索引项”
+            # 形如：
+            #   local <-> obj.prop[idx]
             i0, i1, i2, i3, i4 = instructions[start_idx:start_idx + 5]
             if (i0.op in (VM.GPD, VM.GPDS) and
                 i1.op in (VM.GPI, VM.GPIS) and
@@ -3178,6 +3586,13 @@ class Decompiler:
                     return {'stmt': swap_stmt, 'next_idx': start_idx + 5}
 
         if start_idx + 6 <= end_idx:
+            # 模板 7：局部变量 <-> 深层点属性链
+            #   CP tmp, local
+            #   GPD r1, base, "a"
+            #   GPD r2, r1, "b"
+            #   ...
+            #   SPD last_obj, "leaf", tmp
+            # 这类模式本质也是“先把 local 暂存，再把整条属性链末端值换回来”。
             i0 = instructions[start_idx]
             if i0.op == VM.CP:
                 save_reg, local_reg = i0.operands[0], i0.operands[1]
@@ -3185,12 +3600,14 @@ class Decompiler:
                     j = start_idx + 1
                     read_chain = []
                     while j < end_idx and instructions[j].op in (VM.GPD, VM.GPDS):
+                        # 先收集“从 base 一路向下读到叶子属性”的整条链。
                         read_chain.append(instructions[j])
                         j += 1
 
                     if len(read_chain) >= 2 and j < end_idx:
                         chain_ok = True
                         for ci in range(1, len(read_chain)):
+                            # 每一跳都必须以上一跳产出的寄存器作为对象，才能证明这是一条连续属性链。
                             if read_chain[ci].operands[1] != read_chain[ci - 1].operands[0]:
                                 chain_ok = False
                                 break
@@ -3204,6 +3621,7 @@ class Decompiler:
 
                                 write_chain = []
                                 while j < end_idx and instructions[j].op in (VM.GPD, VM.GPDS):
+                                    # 这里再收集“写回路径”的前缀链，稍后会和 read_chain 对比。
                                     write_chain.append(instructions[j])
                                     j += 1
 
@@ -3220,6 +3638,8 @@ class Decompiler:
 
                                         if (write_props == read_props[:-1] and
                                                 spde_prop == read_props[-1]):
+                                            # 写回链必须与读取链共享同一前缀，
+                                            # 最后再由 `SPD ... save_reg` 写回最末叶子属性。
                                             read_base = read_chain[0].operands[1]
                                             write_base = (write_chain[0].operands[1]
                                                           if write_chain else spde_instr.operands[0])
@@ -3326,6 +3746,7 @@ class Decompiler:
 
     def _try_detect_logical_expr(self, instructions: List[Instruction], obj: CodeObject,
                                    cond_idx: int, end_idx: int, addr_to_idx: Dict[int, int]) -> Optional[Dict]:
+        """看看这段条件跳转能不能还原成 `&&` / `||` 表达式。"""
         jf_instr = instructions[cond_idx]
         if jf_instr.op not in (VM.JF, VM.JNF):
             return None
@@ -3374,6 +3795,7 @@ class Decompiler:
 
     def _try_detect_value_logical_chain(self, instructions: List[Instruction], obj: CodeObject,
                                           cond_idx: int, end_idx: int, addr_to_idx: Dict[int, int]) -> Optional[Dict]:
+        """识别那种会把短路逻辑结果写进寄存器的跳转链。"""
         first_instr = instructions[cond_idx]
         if first_instr.op not in (VM.JF, VM.JNF):
             return None
@@ -3451,6 +3873,7 @@ class Decompiler:
 
     def _try_detect_or_chain(self, instructions: List[Instruction], obj: CodeObject,
                               start_idx: int, end_idx: int, addr_to_idx: Dict[int, int]) -> Optional[Dict]:
+        """识别按 OR 方式串起来的条件判断，并还原成一个整体 if 条件。"""
         jf_instr = instructions[start_idx]
         if jf_instr.op != VM.JF:
             return None
@@ -3499,11 +3922,18 @@ class Decompiler:
             elif instr.op in (VM.JF, VM.JMP, VM.ENTRY):
                 break
 
+        # 模板目标：
+        #   if (a || b || c) { ... }
+        # 或
+        #   if ((a || b || c) && d && e) { ... }
+        # 前半段是一串共享同一 `jf_target` 的 JF，后半段是一串共享同一
+        # `jnf_target` 的 JNF，用来在 OR 成功后继续附加 AND 守卫。
         then_end_idx = jnf_target_idx
         else_end_idx = jnf_target_idx
         has_else = jnf_target_idx < end_idx
 
         for j in range(real_then_start, jnf_target_idx):
+            # 若 then 区里又有一条跳到更远处的 JMP，通常说明还存在 else 分支。
             instr = instructions[j]
             if instr.op == VM.JMP:
                 jmp_target = instr.addr + instr.operands[0]
@@ -3516,6 +3946,7 @@ class Decompiler:
 
         or_conditions = []
 
+        # 第一段条件已经在进入本函数前翻译完毕，直接从当前 flag 取回即可。
         or_conditions.append(self._get_condition(False))
 
         saved_regs = dict(self.regs)
@@ -3523,6 +3954,8 @@ class Decompiler:
         saved_flag_negated = self.flag_negated
 
         for i, jf_idx in enumerate(jf_indices[:-1]):
+            # 后续每个 JF 片段都要从同一个入口寄存器状态重新试跑，
+            # 才能正确取到 `b`、`c` 这些 OR 子条件本身。
             next_jf_idx = jf_indices[i + 1]
             self.regs = dict(saved_regs)
             self.flag = saved_flag
@@ -3545,6 +3978,8 @@ class Decompiler:
 
         and_conditions = []
         if and_jnf_indices:
+            # OR 成功后若还跟着若干共享同一失败出口的 JNF，
+            # 它们在源码层面更接近附加的 `&& extraCond`。
             seg_start = jf_target_idx
             for and_jnf_idx in and_jnf_indices:
                 self.regs = dict(saved_regs)
@@ -3559,11 +3994,14 @@ class Decompiler:
         self.flag = saved_flag
         self.flag_negated = saved_flag_negated
 
+        # 先把前半段 JF 条件串成 `a || b || c`。
         combined_or = or_conditions[0]
         for cond in or_conditions[1:]:
             combined_or = BinaryExpr(combined_or, '||', cond)
 
         if and_conditions:
+            # 再把后半段附加守卫并回：
+            # `(a || b || c) && d && e`
             combined_cond = combined_or
             for cond in and_conditions:
                 combined_cond = BinaryExpr(combined_cond, '&&', cond)
@@ -3583,6 +4021,7 @@ class Decompiler:
 
     def _try_detect_and_chain(self, instructions: List[Instruction], obj: CodeObject,
                                 start_idx: int, end_idx: int, addr_to_idx: Dict[int, int]) -> Optional[Dict]:
+        """识别按 AND 方式组织的条件链并恢复成单个结构。"""
         jnf_instr = instructions[start_idx]
         if jnf_instr.op != VM.JNF:
             return None
@@ -3685,7 +4124,17 @@ class Decompiler:
 
     def _try_process_short_circuit(self, instructions: List[Instruction], obj: CodeObject,
                                     cond_idx: int, end_idx: int, addr_to_idx: Dict) -> Optional[int]:
+        """尝试把一段条件跳转序列还原成 `&&` / `||` 短路逻辑表达式。"""
         instr = instructions[cond_idx]
+        # 模板目标：
+        #   [算 cond1]
+        #   JF/JNF Lset
+        #   [算 cond2]
+        #   JF/JNF Lset
+        #   ...
+        # Lset:
+        #   SETF/SETNF dst
+        # 也就是“先通过跳转链算出短路结果，最后再把结果写进寄存器”。
         target_addr = instr.addr + instr.operands[0]
 
         setf_idx = None
@@ -3693,6 +4142,7 @@ class Decompiler:
         scan_start = cond_idx + 1
         scan_limit = min(scan_start + 30, end_idx)
         for j in range(scan_start, scan_limit):
+            # 先寻找最终把短路结果写回寄存器的 SETF/SETNF。
             if instructions[j].op in (VM.SETF, VM.SETNF):
                 setf_idx = j
                 setf_addr = instructions[j].addr
@@ -3703,6 +4153,7 @@ class Decompiler:
 
         cond_addr = instr.addr
         for j in range(cond_idx, setf_idx):
+            # 确认 cond -> setf 之间没有“跳出模板”的控制流或提前结束。
             inst = instructions[j]
             if inst.op in (VM.JF, VM.JNF):
                 jmp_target = inst.addr + inst.operands[0]
@@ -3715,6 +4166,7 @@ class Decompiler:
                 return None
 
         segments = []
+        # 每个 segment 表示“一段求条件的指令 + 末尾一条 JF/JNF”。
         seg_start = cond_idx
         for j in range(cond_idx, setf_idx):
             inst = instructions[j]
@@ -3728,6 +4180,7 @@ class Decompiler:
 
         conditions = []
         for seg_start_idx, seg_end_idx, jmp_op, jmp_target in segments:
+            # 顺着执行每个 segment，提取它在源码层面真正对应的 cond expr。
             for j in range(seg_start_idx, seg_end_idx):
                 self._translate_instruction(instructions[j], obj)
             cond = self._get_condition(False)
@@ -3741,6 +4194,7 @@ class Decompiler:
             return None
 
         def build_expr(start, end):
+            # 递归把 segment 列表拼回源码里的 `||` / `&&` 结构。
             if start >= end:
                 return ConstExpr(True)
             if start == end - 1:
@@ -3750,6 +4204,7 @@ class Decompiler:
             cond, jmp_op, jmp_target_val = conditions[start]
 
             if jmp_op == VM.JF:
+                # `JF -> setf` 更接近 OR：当前 cond 为假时立刻确定结果。
                 if jmp_target_val == setf_addr:
                     rest = build_expr(start + 1, end)
                     return BinaryExpr(cond, '||', rest)
@@ -3764,6 +4219,7 @@ class Decompiler:
                     rest = build_expr(start + 1, end)
                     return BinaryExpr(cond, '||', rest)
             elif jmp_op == VM.JNF:
+                # `JNF -> setf` 更接近 AND：当前 cond 为假时整串条件失败。
                 if jmp_target_val == setf_addr:
                     rest = build_expr(start + 1, end)
                     return BinaryExpr(cond, '&&', rest)
@@ -3801,6 +4257,7 @@ class Decompiler:
         compound = build_expr(0, len(conditions))
 
         setf_instr = instructions[setf_idx]
+        # 整体若由 SETNF 收尾，说明组合好的布尔表达式还要再翻一次。
         setf_reg = setf_instr.operands[0]
         if setf_instr.op == VM.SETNF:
             compound = self._negate_expr(compound)
@@ -3810,6 +4267,7 @@ class Decompiler:
 
     def _process_if(self, instructions: List[Instruction], obj: CodeObject,
                     cond_idx: int, end_idx: int) -> Optional[Dict]:
+        """识别并恢复普通 if / if-else 结构。"""
         cond_instr = instructions[cond_idx]
         if cond_instr.op not in (VM.JF, VM.JNF):
             return None
@@ -3825,6 +4283,10 @@ class Decompiler:
         target_idx = addr_to_idx[target]
 
         if target_idx < cond_idx:
+            # 模板 1：回跳到当前 loop 的 continue 目标
+            #   [算 cond]
+            #   JF/JNF continue_target
+            # 在线性反编译里更像 `if (cond) continue;`
             current_loop = self.loop_context_stack[-1] if self.loop_context_stack else None
             if current_loop and target == current_loop[2]:
                 cond = self._get_condition(False)
@@ -3834,6 +4296,9 @@ class Decompiler:
                 return {'stmt': stmt, 'next_idx': cond_idx + 1}
             return None
 
+        # 模板 2：优先尝试更高层的逻辑链恢复。
+        # 如果这段其实是短路表达式、值逻辑链、OR/AND 复合条件，
+        # 在这里吃掉会比退化成普通 if 更贴近源码。
         logical_result = self._try_detect_logical_expr(instructions, obj, cond_idx, end_idx, addr_to_idx)
         if logical_result:
             return logical_result
@@ -3852,6 +4317,7 @@ class Decompiler:
             if and_result:
                 return and_result
 
+        # 模板 3：兜底退回普通 if / if-else。
         cond = self._get_condition(False)
 
         if cond_instr.op == VM.JNF:
@@ -3860,6 +4326,7 @@ class Decompiler:
             if_cond = self._negate_expr(cond)
 
         if target_idx >= end_idx:
+            # 跳转目标跑到当前片段外，通常只有 then 体，没有本地 else。
             then_stmts = self._generate_structured_code(instructions, obj, fall_through_idx, end_idx)
             if_stmt = IfStmt(if_cond, then_stmts, [])
             return {'stmt': if_stmt, 'next_idx': end_idx}
@@ -3869,6 +4336,12 @@ class Decompiler:
         then_end_idx = target_idx
 
         if target_idx > fall_through_idx and instructions[target_idx - 1].op == VM.JMP:
+            # 模板 4：标准 if-else 编译形态
+            #   JF/JNF else
+            #   [then...]
+            #   JMP end
+            # else:
+            #   [else...]
             jmp_instr = instructions[target_idx - 1]
             jmp_target = jmp_instr.addr + jmp_instr.operands[0]
             jmp_target_idx = addr_to_idx.get(jmp_target)
@@ -3883,11 +4356,14 @@ class Decompiler:
                     is_break_or_continue = True
 
             if not is_break_or_continue and jmp_target_idx is not None and jmp_target_idx > target_idx:
+                # 专门排除 then 末尾其实是 break/continue 的循环 guard 场景。
                 has_else = True
                 then_end_idx = target_idx - 1
                 else_end_idx = min(jmp_target_idx, end_idx)
 
         if has_else:
+            # 模板 5：若 then/else 两边都只是“给同一寄存器产值”，
+            # 则还有机会进一步压成三元表达式。
             ternary_result = self._try_detect_ternary(
                 instructions, obj, fall_through_idx, then_end_idx,
                 target_idx, else_end_idx, if_cond
@@ -3909,6 +4385,7 @@ class Decompiler:
     def _process_try(self, instructions: List[Instruction], obj: CodeObject,
                      start_idx: int, end_idx: int,
                      loop_context: Optional[Tuple[int, int, int]] = None) -> Optional[Dict]:
+        """识别并恢复 try-catch 结构。"""
         entry_instr = instructions[start_idx]
         if entry_instr.op != VM.ENTRY:
             return None
@@ -3977,6 +4454,7 @@ class Decompiler:
 
     def _process_switch(self, instructions: List[Instruction], obj: CodeObject,
                         start_idx: int, end_idx: int) -> Optional[Dict]:
+        """识别并恢复 switch-case 字节码模式。"""
         addr_to_idx = {ins.addr: i for i, ins in enumerate(instructions)}
 
         jnf_instr = instructions[start_idx]
@@ -3988,11 +4466,21 @@ class Decompiler:
             return None
         ref_reg = instructions[ceq_idx].operands[0]
 
+        # 模板目标：
+        #   CEQ ref, caseVal1
+        #   JNF nextCase
+        #   JMP case1Body
+        #   CEQ ref, caseVal2
+        #   JNF default/end
+        #   ...
+        # 这里并不是直接生成 `switch` AST，而是先把 case 链收集出来，
+        # 再在后半段决定 body 边界、fall-through 和 default。
         case_count = 0
         scan_idx = ceq_idx
         case_infos = []
 
         while scan_idx < end_idx:
+            # 逐个吃掉“CEQ + JNF” case 判定对。
             instr = instructions[scan_idx]
 
             if instr.op == VM.CEQ and instr.operands[0] == ref_reg:
@@ -4057,6 +4545,9 @@ class Decompiler:
         body_regions = []
 
         for i, case_info in enumerate(case_infos):
+            # 每个 case 的 body 起点通常是：
+            # - 紧跟在 JNF 后的一条 JMP 所指向的位置
+            # - 或者 JNF 后直接顺序落下来的位置
             jnf_idx = case_info['jnf_idx']
 
             if jnf_idx + 1 < end_idx and instructions[jnf_idx + 1].op == VM.JMP:
@@ -4121,6 +4612,10 @@ class Decompiler:
         switch_end_idx = addr_to_idx.get(switch_end_addr, end_idx)
 
         body_to_cases: Dict[int, List[Dict]] = {}
+        # 多个 case 可能共享同一 body_start，这在源码里就对应：
+        #   case 1:
+        #   case 2:
+        #       ...
         for case_info in case_infos:
             body_start = case_info.get('body_start', case_info['jnf_target'])
             if body_start not in body_to_cases:
@@ -4143,6 +4638,8 @@ class Decompiler:
             if len(conditions) == 1:
                 combined_cond = conditions[0]
             else:
+                # 共享同一 body 的多个 case，会先合并成：
+                #   ref == v1 || ref == v2 || ...
                 combined_cond = conditions[0]
                 for c in conditions[1:]:
                     combined_cond = BinaryExpr(combined_cond, '||', c)
@@ -4153,6 +4650,11 @@ class Decompiler:
             })
 
         for i, item in enumerate(if_chain):
+            # 第二阶段：给每个 body 估算结束位置。
+            # 关键要区分：
+            # - 正常 `break` 跳出 switch
+            # - 跳到下一个 body 的 fall-through
+            # - 直接 `return`
             body_addr = item['body_addr']
             body_start_idx = addr_to_idx.get(body_addr, end_idx)
 
@@ -4175,6 +4677,7 @@ class Decompiler:
                             body_end_idx = j
                             break
                         elif jmp_target == next_body_addr:
+                            # 这是典型 fall-through：当前 body 末尾显式跳到下一个 case body。
                             fall_through_jmp_idx = j
                             fall_through_target_addr = jmp_target
                 else:
@@ -4219,6 +4722,7 @@ class Decompiler:
         default_body_end_idx = None
 
         if not backward_default and default_or_end_addr < switch_end_addr:
+            # default 体若位于 switch 总结束点之前，就单独作为最后的 else 链挂上。
             has_default = True
             default_body_start_idx = addr_to_idx.get(default_or_end_addr, end_idx)
             default_body_end_idx = switch_end_idx
@@ -4226,6 +4730,8 @@ class Decompiler:
         result_stmt = None
 
         for i, item in enumerate(if_chain):
+            # 这里旧线性反编译器并没有真正构造 `SwitchStmt`，
+            # 而是保守地把 switch 退化成一串 if / else if。
             cond = item['condition']
             body_start = item['body_start_idx']
             body_end = item['body_end_idx']
@@ -4235,6 +4741,8 @@ class Decompiler:
             body_stmts = self._generate_structured_code(instructions, obj, body_start, body_end)
 
             if 'fall_through_start' in item and 'fall_through_end' in item:
+                # fall-through 的后继 body 要直接拼到当前 body 后面，
+                # 才能接近源码里“case 没有 break 时继续向下执行”的效果。
                 fall_through_stmts = self._generate_structured_code(
                     instructions, obj, item['fall_through_start'], item['fall_through_end'])
                 body_stmts.extend(fall_through_stmts)
@@ -4270,6 +4778,7 @@ class Decompiler:
                            then_start: int, then_end: int,
                            else_start: int, else_end: int,
                            condition: Expr) -> Optional[Dict]:
+        """尝试把 then/else 双分支压回三元表达式。"""
         then_result = self._analyze_branch_for_ternary(instructions, then_start, then_end, obj)
         if then_result is None:
             return None
@@ -4320,6 +4829,24 @@ class Decompiler:
     def _try_detect_nested_ternary(self, instructions: List[Instruction], obj: CodeObject,
                                    start_idx: int, end_idx: int,
                                    expected_target_reg: int) -> Optional[Expr]:
+        """尝试把 else 分支里继续嵌套的一段 if/jump 识别成嵌套三元。
+
+        这类模式在字节码里通常不是 AST 形式，而是：
+            [算 cond1]
+            jf else1
+              [then1 产值]
+              jmp end
+            else1:
+              [算 cond2]
+              jf else2
+                [then2 产值]
+                jmp end2
+              else2:
+                [else2 产值]
+
+        为了确认它真的能压成 `a ? b : (c ? d : e)`，这里会多次 speculative
+        地试跑相同片段，并在每一步失败时完整回滚。
+        """
         if start_idx >= end_idx:
             return None
 
@@ -4360,6 +4887,7 @@ class Decompiler:
                     nested_end_idx = jmp_target_idx
                     break
 
+        # 第一轮试跑：只执行条件前缀，看看能否得到稳定的 nested condition。
         snapshot = self._save_speculative_state()
         for i in range(start_idx, jnf_idx):
             self._translate_instruction(instructions[i], obj)
@@ -4376,6 +4904,7 @@ class Decompiler:
             instructions, nested_else_idx, nested_end_idx, obj)
 
         if nested_then_result is None or nested_else_result is None:
+            # 任一分支不能被概括成“产出一个值”，就不能安全压成三元。
             self._restore_speculative_state(snapshot)
             return None
 
@@ -4383,13 +4912,16 @@ class Decompiler:
         nested_else_reg, nested_else_side = nested_else_result
 
         if nested_then_reg != nested_else_reg:
+            # 两支若落到不同目标寄存器，源码层面就不是一个统一表达式的两侧。
             self._restore_speculative_state(snapshot)
             return None
 
         if nested_then_side or nested_else_side:
+            # 分支里一旦夹杂明显副作用，就宁可保守退回语句结构。
             self._restore_speculative_state(snapshot)
             return None
 
+        # 第二轮：在同一初始状态下重放 then 路径，实际提取 true_expr。
         self._restore_speculative_state(snapshot)
         for i in range(start_idx, jnf_idx):
             self._translate_instruction(instructions[i], obj)
@@ -4397,6 +4929,8 @@ class Decompiler:
             self._translate_instruction(instructions[i], obj)
         nested_true_expr = self.regs.get(nested_then_reg, VoidExpr())
 
+        # 第三轮：重新回到干净入口，再提取 else 路径。
+        # 之所以不能直接接着上一轮状态跑，是因为 then 路径已经污染了寄存器/flag。
         self._restore_speculative_state(snapshot)
         for i in range(start_idx, jnf_idx):
             self._translate_instruction(instructions[i], obj)
@@ -4411,17 +4945,29 @@ class Decompiler:
                 self._translate_instruction(instructions[i], obj)
             nested_false_expr = self.regs.get(nested_else_reg, VoidExpr())
 
+        # 无论成功失败，离开前都把 speculative 污染清空，
+        # 让外层正式翻译从原始入口状态继续。
         self._restore_speculative_state(snapshot)
 
         return TernaryExpr(nested_if_cond, nested_true_expr, nested_false_expr)
 
     def _finalize_pending_literal(self, reg: int) -> Expr:
+        """把某个 pending 容器寄存器真正实体化成数组/字典字面量。
+
+        这是“延迟实体化”链路的收口点。只有当外层逻辑确认：
+        - 这个寄存器现在要被当作一个完整值读取
+        - 而不是继续接受更多 `SPI/SPD` 填充
+
+        才会把累计的元素/键值对一次性组装成 `ArrayExpr` / `DictExpr`。
+        """
         if reg in self.pending_dicts:
+            # Dictionary 是边累计 `(key, value)`，边等最后一次“读整对象”时再变成 `%[...]`。
             items = self.pending_dicts.pop(reg)
             result = DictExpr(items)
             self.regs[reg] = result
             return result
         if reg in self.pending_arrays:
+            # Array 同理，只有第一次真正取值时才从 pending 列表折叠成 `[ ... ]`。
             elements = self.pending_arrays.pop(reg)
             self.pending_counters.discard(reg + 1)
             result = ArrayExpr(elements)
@@ -4432,6 +4978,14 @@ class Decompiler:
     def _analyze_branch_for_ternary(self, instructions: List[Instruction],
                                     start_idx: int, end_idx: int,
                                     obj: CodeObject) -> Optional[Tuple[int, bool]]:
+        """静态估计一个分支能否被视作“为某个寄存器产值”的纯表达式分支。
+
+        返回 `(target_reg, has_side_effects)`：
+        - `target_reg`：这段分支最终把值落到哪个寄存器
+        - `has_side_effects`：是否包含不宜压成三元表达式的副作用
+
+        这是 speculative 真正试跑前的预筛选，目的是先排掉明显不安全的候选。
+        """
         if start_idx >= end_idx:
             return None
 
@@ -4449,6 +5003,7 @@ class Decompiler:
             elif op == VM.CP:
                 r1 = ops[0]
                 if r1 < -2:
+                    # 直接写局部槽通常更像语句副作用，而不是纯表达式求值。
                     has_side_effects = True
                 target_reg = r1
             elif op == VM.CL:
@@ -4498,6 +5053,7 @@ class Decompiler:
                 target_reg = r1
             elif op in (VM.SPD, VM.SPDE, VM.SPDEH, VM.SPDS, VM.SPI, VM.SPIE, VM.SPIS):
                 if ops[0] in local_new_regs:
+                    # 某些 `NEW` 后跟属性填充，仍可视作在构造一个新值对象。
                     target_reg = ops[0]
                 else:
                     has_side_effects = True
@@ -4518,6 +5074,16 @@ class Decompiler:
         return None
 
     def _get_condition(self, negate: bool = False) -> Expr:
+        """把 `flag + flag_negated` 还原成当前应当看到的条件表达式。
+
+        可以把它理解成条件状态机的“读口”：
+        - `TT/TF/CEQ/...` 负责写入 `flag`
+        - `NF` 负责翻转 `flag_negated`
+        - `SETF/SETNF/JF/JNF` 等则通过这里把状态读成最终 Expr
+
+        `negate=True` 表示“调用方还希望再额外取反一层”。
+        最终结果 = `flag` 叠加 `flag_negated`，再叠加调用方要求的 `negate`。
+        """
         if self.flag is None:
             return ConstExpr(True)
 
@@ -4531,6 +5097,18 @@ class Decompiler:
         return cond
 
     def _negate_expr(self, expr: Expr) -> Expr:
+        """尽量结构化地对条件取反，而不是一律包成 `!(...)`。
+
+        例如：
+        - `a == b`   -> `a != b`
+        - `a < b`    -> `a >= b`
+        - `x && y`   -> `!x || !y`
+        - `x || y`   -> `!x && !y`
+
+        这么做有两个好处：
+        1. 输出源码更自然，少很多机械的 `!()` 包裹
+        2. 后续再参与 compound-if / ternary 合并时更容易继续化简
+        """
         if isinstance(expr, UnaryExpr) and expr.op == '!':
             return expr.operand
         if isinstance(expr, BinaryExpr):
@@ -4549,11 +5127,17 @@ class Decompiler:
         return UnaryExpr('!', expr)
 
     def _make_pending_spie_stmt(self, pending: dict) -> Stmt:
+        """把挂起的 SPxE/SPxIS 赋值信息真正落成语句节点。"""
         if pending.get('is_class_member_var') and pending.get('member_name'):
             return VarDeclStmt(pending['member_name'], pending['value'])
         return ExprStmt(AssignExpr(pending['target'], pending['value']))
 
     def _flush_pending_spie(self):
+        """强制冲刷当前挂起的副作用赋值。
+
+        当控制流边界、代码块结束、或我们确认后续不再消费该赋值结果时，
+        就把 `_pending_spie` 立即落成一条真实语句。
+        """
         if self._pending_spie is not None:
             pending = self._pending_spie
             self._pending_spie = None
@@ -4561,11 +5145,16 @@ class Decompiler:
         return None
 
     def _collect_pre_stmts(self, stmts: list):
+        """把之前延迟确认的前置语句批量并入当前语句列表。"""
         if self._pre_stmts:
             stmts.extend(self._pre_stmts)
             self._pre_stmts.clear()
 
     def _translate_instruction(self, instr: Instruction, obj: CodeObject) -> Optional[Stmt]:
+        """把单条 VM 指令翻译成寄存器状态变化或一条源码语句。"""
+        # 这是 `_current_addr` 最主要的维护点：每正式翻译一条指令，先把地址上下文
+        # 切到这条指令。之后所有 `get_reg(-3)` / `_get_local_name(-5)` 之类调用，
+        # 都会据此决定当前落在哪个 register-split component。
         self._current_addr = instr.addr
         if self._pending_func_decl_obj_idx is not None and instr.op != VM.CP:
             self._pending_func_decl_obj_idx = None
@@ -4575,6 +5164,12 @@ class Decompiler:
             ops_check = instr.operands
             if (op_check == VM.CP and len(ops_check) >= 2 and
                     ops_check[1] == pending['value_reg'] and ops_check[0] < -2):
+                # 最理想的链式场景：
+                #   spd/spi 先把 `target = value` 挂起
+                #   紧跟 `CP localX, value_reg`
+                # 这通常对应源码里的链式赋值：
+                #   localX = (target = value)
+                # 因而不能先吐出独立语句，而要把赋值结果继续当表达式传下去。
                 self._pending_spie = None
                 self._prev_instruction = instr
                 r1_cp = ops_check[0]
@@ -4618,14 +5213,18 @@ class Decompiler:
                                 has_pending_use = True
                                 break
                 if has_pending_use:
+                    # 后面的调用直接消费了右值寄存器，那挂起赋值应嵌成表达式：
+                    #   f(target = value)
                     self._pending_spie = None
                     self.regs[vreg] = AssignExpr(pending['target'], pending['value'])
                 else:
+                    # 调用没有继续读这个右值，说明链式机会已经过去，赋值应前置落地。
                     self._pending_spie = None
                     self._pre_stmts.append(self._make_pending_spie_stmt(pending))
             elif op_check == VM.CHGTHIS:
                 vreg = pending['value_reg']
                 if len(ops_check) >= 2 and ops_check[1] == vreg:
+                    # `func incontextof (target = value)` 这类场景同样可以内嵌。
                     self._pending_spie = None
                     self.regs[vreg] = AssignExpr(pending['target'], pending['value'])
                 else:
@@ -4661,6 +5260,8 @@ class Decompiler:
                                    len(ops_check) > 0 and ops_check[0] < -2)
                 is_side_effect = op_check in _SIDE_EFFECT_OPS
                 if writes_to_vreg or writes_to_local or is_side_effect:
+                    # 一旦后续要覆盖右值寄存器、写局部、或发生明显副作用，
+                    # 就不能再指望把挂起赋值安全地嵌入更大的表达式了。
                     self._pending_spie = None
                     self._pre_stmts.append(self._make_pending_spie_stmt(pending))
 
@@ -4680,6 +5281,9 @@ class Decompiler:
             if r == -1:
                 return ThisExpr()
             if r == -2:
+                # `-2` 是个很关键的特殊寄存器：
+                # 在普通上下文里通常代表 this 代理，
+                # 在 with 作用域里则要解析成 with 代理对象。
                 in_with = any(start <= self._current_addr < end
                               for start, end in self._with_active_ranges)
                 if in_with:
@@ -4690,12 +5294,18 @@ class Decompiler:
                 return VarExpr(name)
 
             if r in self.pending_dicts:
+                # `new Dictionary()` 常被编译成：
+                #   NEW r
+                #   SPI r, key1, val1
+                #   SPI r, key2, val2
+                # 这里直到“第一次把整个 r 读出来”时，才折叠成字典字面量。
                 items = self.pending_dicts.pop(r)
                 result = DictExpr(items)
                 self.regs[r] = result
                 return result
 
             if r in self.pending_arrays:
+                # `new Array()` 同理，先累计元素，最后一次性变成 `[ ... ]`。
                 elements = self.pending_arrays.pop(r)
                 self.pending_counters.discard(r + 1)
                 result = ArrayExpr(elements)
@@ -4723,9 +5333,11 @@ class Decompiler:
                     if 0 <= obj_idx < len(self.loader.objects):
                         ref_obj = self.loader.objects[obj_idx]
                         if ref_obj.context_type == 2:
+                            # 表达式函数可以直接内联成匿名函数表达式。
                             return self._decompile_anon_func(ref_obj)
                         if (obj_idx in self._func_child_by_obj_index
                                 and obj_idx not in self._func_children_at_top):
+                            # 具名子函数则先记为“待内联声明”，等 CP 把它绑定到名字时再输出。
                             self._pending_func_decl_obj_idx = obj_idx
                     return FuncRefExpr(obj_idx, self.loader)
             return ConstExpr(val)
@@ -4734,16 +5346,20 @@ class Decompiler:
             return None
 
         if op == VM.NF:
+            # `NF` 不生成新条件，只是把“当前条件要不要取反”这件事翻转一次。
+            # 这样连续出现多个 NF 时，只需来回切换状态位，而不必层层套 `!(!(...))`。
             self.flag_negated = not self.flag_negated
             return None
 
         if op == VM.CONST:
+            # `CONST dst, data_idx`：把常量池项装入寄存器。
             r, idx = ops[0], ops[1]
             val = get_data(idx)
             set_reg(r, make_const(val))
             return None
 
         if op == VM.CL:
+            # `CL` 可以理解为“clear local/slot”，这里恢复成 `void`。
             r = ops[0]
             set_reg(r, VoidExpr())
             if r < -2:
@@ -4762,6 +5378,7 @@ class Decompiler:
             return None
 
         if op == VM.GLOBAL:
+            # 在 with 父作用域里，GLOBAL 更适合恢复成点前缀代理 `.foo` 的宿主。
             if self._parent_in_with:
                 set_reg(ops[0], WithDotProxy())
             else:
@@ -4769,16 +5386,21 @@ class Decompiler:
             return None
 
         if op == VM.TT:
+            # `TT r`：把寄存器表达式直接作为当前条件源，按正向条件解释。
             self.flag = get_reg(ops[0])
             self.flag_negated = False
             return None
 
         if op == VM.TF:
+            # `TF r`：同样读取寄存器，但默认按“反向条件”解释。
+            # 它和 `TT + NF` 在效果上很接近，只是编码更直接。
             self.flag = get_reg(ops[0])
             self.flag_negated = True
             return None
 
         if op in (VM.CEQ, VM.CDEQ, VM.CLT, VM.CGT):
+            # 比较结果并不立刻写成布尔常量，而是暂存在 `flag` 中，
+            # 后面的 JF/JNF/SETF/SETNF 会继续消费它。
             left = get_reg(ops[0])
             right = get_reg(ops[1])
             op_sym = BINARY_OP_SYMBOLS.get(op, '==')
@@ -4787,11 +5409,13 @@ class Decompiler:
             return None
 
         if op == VM.SETF:
+            # 把当前条件状态按“正向”读成一个普通表达式值。
             cond = self._get_condition(False)
             set_reg(ops[0], cond)
             return None
 
         if op == VM.SETNF:
+            # 与 SETF 相同，但调用方额外要求再取反一层。
             cond = self._get_condition(True)
             set_reg(ops[0], cond)
             return None
@@ -4801,10 +5425,14 @@ class Decompiler:
             src = get_reg(r2)
 
             if instr.addr in self._with_cp_addrs:
+                # 特殊模式：某条 CP 实际是 with 入口，不是普通赋值。
                 set_reg(r1, src)
                 return _WithMarkerStmt(src, level=r1)
 
             if hasattr(self, '_callexpr_temp_cp_addrs') and instr.addr in self._callexpr_temp_cp_addrs:
+                # 这类 CP 对应“把一个有副作用且后续会多次使用的调用结果绑定到中间寄存器”。
+                # 直接把源表达式继续内联会显得像重复求值，因此强制落成：
+                #   var _tempN = call(...)
                 name = f'_temp{r1}'
                 set_reg(r1, VarExpr(name))
                 self.declared_vars.add(name)
@@ -4814,6 +5442,8 @@ class Decompiler:
                 obj_idx = self._pending_func_decl_obj_idx
                 self._pending_func_decl_obj_idx = None
                 if obj_idx in self._func_child_by_obj_index:
+                    # `CONST inter_object` 之后常接一条 `CP localX, reg`，
+                    # 这正是把匿名代码对象绑定成具名函数声明的最佳时机。
                     child_obj = self._func_child_by_obj_index[obj_idx]
                     func_name = child_obj.name or f'_func{obj_idx}'
                     set_reg(r1, VarExpr(func_name))
@@ -4826,6 +5456,7 @@ class Decompiler:
                     return FuncDeclStmt(defn_text, name=func_name)
 
             if r1 < -2:
+                # 写入负寄存器意味着写本地变量，而不是普通临时寄存器。
                 name = self._get_local_name(r1)
                 set_reg(r1, VarExpr(name))
 
@@ -4835,6 +5466,8 @@ class Decompiler:
                     (instr.addr in self._cp_side_effect_alias_addrs and
                      _expr_has_side_effect(src))
                 ):
+                    # 对容器或带副作用表达式做 CP 时，字节码后续可能仍把源寄存器
+                    # 当作同一对象使用，这里主动把源也绑定到同一变量名，避免复制语义。
                     set_reg(r2, VarExpr(name))
                     if not isinstance(src, (DictExpr, ArrayExpr)):
                         _cp_aliased = True
@@ -4848,6 +5481,9 @@ class Decompiler:
                     stmt._cp_aliased = True
 
                 if instr.addr in self._cp_alias_defer_addrs:
+                    # 某些 `local = expr` 语句虽然已经能构造出来，但若此刻立即输出，
+                    # 会和后续 alias / snapshot 推断打架。先缓存到 `_deferred_cp_stmts`，
+                    # 等当前线性片段处理完再统一补到语句流里。
                     self._deferred_cp_stmts.append(stmt)
                     return None
 
@@ -4923,6 +5559,10 @@ class Decompiler:
             op_sym = '++' if op == VM.INC else '--'
 
             if r < -2 and prev_instr is not None:
+                # 常见后缀形式：
+                #   CP tmp, local
+                #   INC local
+                # 更接近 `tmp = local++` 而不是 `tmp = ++local`。
                 if (prev_instr.op == VM.CP and
                     prev_instr.operands[1] == r and
                     prev_instr.operands[0] >= 0):
@@ -4935,6 +5575,10 @@ class Decompiler:
             return ExprStmt(UnaryExpr(op_sym, target, prefix=True))
 
         if op in (VM.INCPD, VM.DECPD):
+            # 点属性自增/自减：
+            #   GPD tmp, obj, "x"
+            #   INCPD 0, obj, "x"
+            # 往往更像 `tmp = obj.x++` 或 `++obj.x`。
             r1, r2, idx = ops[0], ops[1], ops[2]
             obj_expr = get_reg(r2)
             prop = get_data(idx)
@@ -4960,6 +5604,9 @@ class Decompiler:
             return ExprStmt(result)
 
         if op in (VM.INCPI, VM.DECPI):
+            # 索引属性自增/自减：
+            #   obj[idx]++
+            #   ++obj[idx]
             r1, r2, r3 = ops[0], ops[1], ops[2]
             obj_expr = get_reg(r2)
             idx_expr = get_reg(r3)
@@ -4982,6 +5629,8 @@ class Decompiler:
             return ExprStmt(result)
 
         if op in (VM.INCP, VM.DECP):
+            # `GETP/SETP` 这一套对应“属性引用”上的读写，
+            # 所以这里的 INCP/DECP 是对“引用目标”做 ++/--。
             r1, r2 = ops[0], ops[1]
             target = get_reg(r2)
             op_sym = '++' if op == VM.INCP else '--'
@@ -5001,6 +5650,12 @@ class Decompiler:
             return ExprStmt(result)
 
         binary_ops_base = {
+            # 这一组是最常见的复合运算家族。
+            # 同一个 base opcode 会派生出：
+            # - base      : 寄存器/局部变量自身更新
+            # - base + 1  : 点属性复合赋值
+            # - base + 2  : 索引属性复合赋值
+            # - base + 3  : 属性引用复合赋值
             VM.LOR: '||', VM.LAND: '&&', VM.BOR: '|', VM.BXOR: '^', VM.BAND: '&',
             VM.SAR: '>>', VM.SAL: '<<', VM.SR: '>>>',
             VM.ADD: '+', VM.SUB: '-', VM.MUL: '*', VM.DIV: '/', VM.MOD: '%', VM.IDIV: '\\'
@@ -5008,6 +5663,9 @@ class Decompiler:
 
         for base_op, op_sym in binary_ops_base.items():
             if op == base_op:
+                # 例：
+                #   ADD local0, r1  -> local0 += r1
+                #   ADD r3, r4      -> r3 = r3 + r4
                 r1, r2 = ops[0], ops[1]
                 target = get_reg(r1)
                 right = get_reg(r2)
@@ -5019,6 +5677,7 @@ class Decompiler:
 
         for base_op, op_sym in binary_ops_base.items():
             if op == base_op + 1:
+                # 例：`obj.x += value`
                 r1, r2, idx, r3 = ops[0], ops[1], ops[2], ops[3]
                 obj_expr = get_reg(r2)
                 prop = get_data(idx)
@@ -5034,6 +5693,7 @@ class Decompiler:
 
         for base_op, op_sym in binary_ops_base.items():
             if op == base_op + 2:
+                # 例：`obj[idx] += value`
                 r1, r2, r3, r4 = ops[0], ops[1], ops[2], ops[3]
                 obj_expr = get_reg(r2)
                 idx_expr = get_reg(r3)
@@ -5046,6 +5706,7 @@ class Decompiler:
 
         for base_op, op_sym in binary_ops_base.items():
             if op == base_op + 3:
+                # 例：`*prop_ref += value`
                 r1, r2, r3 = ops[0], ops[1], ops[2]
                 target = get_reg(r2)
                 value = get_reg(r3)
@@ -5055,6 +5716,9 @@ class Decompiler:
                 return stmt
 
         if op in (VM.GPD, VM.GPDS):
+            # 获取点属性：
+            # - `GPD`  -> `obj.prop`
+            # - `GPDS` -> `&obj.prop`，即属性引用/地址语义
             r1, r2, idx = ops[0], ops[1], ops[2]
             prop = get_data(idx)
             obj_expr = get_reg(r2)
@@ -5070,6 +5734,9 @@ class Decompiler:
             return None
 
         if op in (VM.GPI, VM.GPIS):
+            # 获取索引属性：
+            # - `GPI`  -> `obj[idx]`
+            # - `GPIS` -> `&obj[idx]`
             r1, r2, r3 = ops[0], ops[1], ops[2]
             obj_expr = get_reg(r2)
             idx_expr = get_reg(r3)
@@ -5080,6 +5747,13 @@ class Decompiler:
             return None
 
         if op in (VM.SPD, VM.SPDE, VM.SPDEH, VM.SPDS):
+            # 设置点属性：
+            # - `SPD`/相关变体 -> `obj.prop = value`
+            # - `SPDS`         -> `&obj.prop = value` 风格的引用赋值
+            #
+            # 这里最麻烦的是：
+            # 1. 类体里的成员声明也会长得像属性写入；
+            # 2. 某些右值需要延迟输出，避免和后续读取时序冲突。
             r1, idx, r3 = ops[0], ops[1], ops[2]
             prop = get_data(idx)
             value = get_reg(r3)
@@ -5099,9 +5773,19 @@ class Decompiler:
                 isinstance(value, (DictExpr, ArrayExpr)) or
                 (isinstance(value, CallExpr) and value.is_new)
             ):
+                # 容器/new 表达式经常先放进寄存器，再立刻被属性写入和继续使用。
+                # 这里先挂起，等确认后续是否还要把“赋值结果”当表达式复用。
                 deferred_target = target
                 if op == VM.SPDS and self._should_emit_spds_ampersand(r1):
                     deferred_target = UnaryExpr('&', target)
+                # 这里不立刻返回 `target = value;`，而是先记到 `_pending_spie`。
+                # 后面若马上出现：
+                #   CP localX, rValue
+                # 或
+                #   CALL ..., rValue
+                # 就有机会恢复成：
+                #   localX = (target = value)
+                #   foo(target = value)
                 self._pending_spie = {
                     'target': deferred_target,
                     'value': value,
@@ -5127,21 +5811,35 @@ class Decompiler:
                         return None
 
             if is_class_member_var and isinstance(prop, str):
+                # 类体中的 `this.member = void` / `this.member = value`
+                # 更像类成员定义而非普通运行时赋值。
                 val_expr = None if isinstance(value, VoidExpr) else value
                 return VarDeclStmt(prop, val_expr)
 
             return ExprStmt(AssignExpr(target, value))
 
         if op in (VM.SPI, VM.SPIE, VM.SPIS):
+            # 设置索引属性，另外还兼容数组/字典构造期的“逐项填充”。
+            #
+            # 例如：
+            #   new Array()
+            #   SPI arr, idx, value
+            # 会优先累计到 `pending_arrays`，最终恢复成 `[ ... ]`。
             r1, r2, r3 = ops[0], ops[1], ops[2]
 
             if r1 in self.pending_dicts:
+                # pending Dictionary 分支：
+                # 此时 SPI 不再解释成普通 `obj[idx] = value`，
+                # 而是解释成“给字面量草稿再添一组 key/value”。
                 key_expr = get_reg(r2)
                 value_expr = get_reg(r3)
                 self.pending_dicts[r1].append((key_expr, value_expr))
                 return None
 
             if r1 in self.pending_arrays:
+                # pending Array 分支：
+                # `r2` 常只是编译器维护的索引/计数寄存器，源码层面通常并不需要显式保留，
+                # 真正重要的是元素追加顺序。
                 self.pending_counters.add(r2)
                 value_expr = get_reg(r3)
                 self.pending_arrays[r1].append(value_expr)
@@ -5156,6 +5854,12 @@ class Decompiler:
                 target = UnaryExpr('&', target)
 
             if r3 > 0:
+                # 与点属性写入同理，右值寄存器后面可能还会被当作表达式继续读取。
+                # 例如：
+                #   SPI obj, idx, r3
+                #   CALL r0, fn, 1, r3
+                # 更接近源码：
+                #   fn(obj[idx] = value)
                 self._pending_spie = {
                     'target': target,
                     'value': value,
@@ -5166,12 +5870,19 @@ class Decompiler:
             return ExprStmt(AssignExpr(target, value))
 
         if op == VM.CALL:
+            # 普通函数调用：
+            #   CALL r0, fn, argc, ...
+            # 若结果寄存器为 0，则更像独立语句 `fn(...)`。
             r1, r2 = ops[0], ops[1]
             argc = ops[2]
             func_expr = get_reg(r2)
             args = self._parse_call_args(ops, 3, argc)
             result = CallExpr(func_expr, args)
             if r1 > 0 and instr.addr in self._side_effect_multi_read_addrs:
+                # 对“有副作用且后续会多次读取”的普通调用，优先提临时变量：
+                #   var _temp1 = foo();
+                # 而不是把 `foo()` 原样散落到多个后续位置。
+                # 某些有副作用的调用结果会被读取多次，先落成临时变量更稳。
                 name = f'_temp{r1}'
                 set_reg(r1, VarExpr(name))
                 self.declared_vars.add(name)
@@ -5182,6 +5893,7 @@ class Decompiler:
             return None
 
         if op == VM.CALLD:
+            # 点方法调用：`obj.method(args...)`
             r1, r2, idx = ops[0], ops[1], ops[2]
             argc = ops[3]
             obj_expr = get_reg(r2)
@@ -5194,6 +5906,9 @@ class Decompiler:
                 isinstance(obj_expr.func.prop, str) and
                 obj_expr.func.prop == 'RegExp' and
                 len(obj_expr.args) == 0):
+                # 这是 TJS2/krkr 里一个比较特别的正则构造链：
+                #   (new RegExp())._compile("...")
+                # 这里尽量折回更自然的正则字面量来源。
                 pattern_arg = args[0] if args else None
                 if isinstance(pattern_arg, ConstExpr) and isinstance(pattern_arg.value, str):
                     pattern_str = pattern_arg.value
@@ -5203,6 +5918,7 @@ class Decompiler:
 
             result = MethodCallExpr(obj_expr, method if isinstance(method, str) else make_const(method), args)
             if r1 > 0 and instr.addr in self._side_effect_multi_read_addrs:
+                # 点方法调用同理，避免 `obj.m()` 被误看成可无代价复制的纯表达式。
                 name = f'_temp{r1}'
                 set_reg(r1, VarExpr(name))
                 self.declared_vars.add(name)
@@ -5213,6 +5929,7 @@ class Decompiler:
             return None
 
         if op == VM.CALLI:
+            # 索引方法调用：`obj[methodExpr](args...)`
             r1, r2, r3 = ops[0], ops[1], ops[2]
             argc = ops[3]
             obj_expr = get_reg(r2)
@@ -5220,6 +5937,7 @@ class Decompiler:
             args = self._parse_call_args(ops, 4, argc)
             result = MethodCallExpr(obj_expr, method_expr, args)
             if r1 > 0 and instr.addr in self._side_effect_multi_read_addrs:
+                # 索引方法调用也走同一套保守策略。
                 name = f'_temp{r1}'
                 set_reg(r1, VarExpr(name))
                 self.declared_vars.add(name)
@@ -5230,6 +5948,10 @@ class Decompiler:
             return None
 
         if op == VM.NEW:
+            # 构造调用：
+            #   NEW r, ctor, argc, ...
+            # 对 `new Array()` / `new Dictionary()` 还会转入 pending 容器模式，
+            # 以便后续恢复成字面量。
             r1, r2 = ops[0], ops[1]
             argc = ops[2]
             ctor = get_reg(r2)
@@ -5237,6 +5959,8 @@ class Decompiler:
             result = CallExpr(ctor, args, is_new=True)
 
             if instr.addr in self._side_effect_multi_read_addrs:
+                # `new Foo()` 若后面会被多次读取/展开，也先固化到临时变量，
+                # 防止后文看起来像多次构造对象。
                 skip = False
                 if argc == 0 and isinstance(ctor, PropertyExpr):
                     ctor_name = ctor.prop if isinstance(ctor.prop, str) else None
@@ -5251,10 +5975,13 @@ class Decompiler:
             if argc == 0 and isinstance(ctor, PropertyExpr):
                 ctor_name = ctor.prop if isinstance(ctor.prop, str) else None
                 if ctor_name == 'Dictionary':
+                    # 不急着固定成 `new Dictionary()`：
+                    # 如果后面紧跟一串 SPI 填充，源码层面更像 `%[...]` 字面量。
                     self.pending_dicts[r1] = []
                     set_reg(r1, result)
                     return None
                 elif ctor_name == 'Array':
+                    # `new Array()` 同理，先进入 pending 模式，等待后续 SPI 补元素。
                     self.pending_arrays[r1] = []
                     set_reg(r1, result)
                     return None
@@ -5263,6 +5990,7 @@ class Decompiler:
             return None
 
         if op == VM.CHKINS:
+            # `CHKINS` 在高层语义上更接近 `instanceof`。
             r1, r2 = ops[0], ops[1]
             left = get_reg(r1)
             right = get_reg(r2)
@@ -5273,6 +6001,8 @@ class Decompiler:
             return None
 
         if op == VM.CHGTHIS:
+            # `CHGTHIS` 对应 TJS 的 `incontextof` 绑定调用上下文。
+            # 例：`func incontextof obj`
             r1, r2 = ops[0], ops[1]
             func = get_reg(r1)
             ctx = get_reg(r2)
@@ -5280,28 +6010,33 @@ class Decompiler:
             return None
 
         if op == VM.GETP:
+            # 取属性引用所指向的值：`*propRef`
             r1, r2 = ops[0], ops[1]
             prop_ref = get_reg(r2)
             set_reg(r1, UnaryExpr('*', prop_ref))
             return None
 
         if op == VM.SETP:
+            # 给属性引用所指向的位置赋值：`*propRef = value`
             r1, r2 = ops[0], ops[1]
             prop_ref = get_reg(r1)
             value = get_reg(r2)
             return ExprStmt(AssignExpr(UnaryExpr('*', prop_ref), value))
 
         if op == VM.TYPEOF:
+            # 单寄存器版 `typeof expr`
             r = ops[0]
             set_reg(r, TypeofExpr(get_reg(r)))
             return None
 
         if op == VM.CHKINV:
+            # 单寄存器版 `isvalid expr`
             r = ops[0]
             set_reg(r, IsValidExpr(get_reg(r)))
             return None
 
         if op == VM.TYPEOFD:
+            # 点属性版 `typeof obj.prop`
             r1, r2, idx = ops[0], ops[1], ops[2]
             obj_expr = get_reg(r2)
             prop = get_data(idx)
@@ -5310,6 +6045,7 @@ class Decompiler:
             return None
 
         if op == VM.TYPEOFI:
+            # 索引属性版 `typeof obj[idx]`
             r1, r2, r3 = ops[0], ops[1], ops[2]
             obj_expr = get_reg(r2)
             idx_expr = get_reg(r3)
@@ -5318,6 +6054,7 @@ class Decompiler:
             return None
 
         if op == VM.DELD:
+            # 删除点属性：`delete obj.prop`
             r1, r2, idx = ops[0], ops[1], ops[2]
             obj_expr = get_reg(r2)
             prop = get_data(idx)
@@ -5329,6 +6066,7 @@ class Decompiler:
             return ExprStmt(expr)
 
         if op == VM.DELI:
+            # 删除索引属性：`delete obj[idx]`
             r1, r2, r3 = ops[0], ops[1], ops[2]
             obj_expr = get_reg(r2)
             idx_expr = get_reg(r3)
@@ -5340,6 +6078,8 @@ class Decompiler:
             return ExprStmt(expr)
 
         if op == VM.SRV:
+            # `SRV` 是真正携带返回值的 return；
+            # 而裸 `RET` 更像函数结尾控制流标记。
             r = ops[0]
             if r == 0:
                 return ReturnStmt(None)
@@ -5349,12 +6089,14 @@ class Decompiler:
             return None
 
         if op == VM.THROW:
+            # 异常抛出。
             return ThrowStmt(get_reg(ops[0]))
 
         if op == VM.ENTRY:
             return None
 
         if op == VM.INV:
+            # TJS 的 `invalidate x`。
             r = ops[0]
             return ExprStmt(CallExpr(VarExpr('invalidate'), [get_reg(r)]))
 
@@ -5362,11 +6104,13 @@ class Decompiler:
             return None
 
         if op == VM.EVAL:
+            # 这里恢复成后缀 `!`，对应 TJS 某些求值/展开语义的记号形式。
             r = ops[0]
             set_reg(r, UnaryExpr('!', get_reg(r), prefix=False))
             return None
 
         if op == VM.EEXP:
+            # 作为独立语句出现的后缀 `!`。
             r = ops[0]
             return ExprStmt(UnaryExpr('!', get_reg(r), prefix=False))
 
@@ -5374,10 +6118,15 @@ class Decompiler:
         return None
 
     def _parse_call_args(self, ops: List[int], start_idx: int, argc: int) -> List[Expr]:
+        """按 TJS2 的多种参数编码格式恢复调用实参列表。"""
         args = []
 
         def get_arg_expr(reg: int, arg_pos: int = -1) -> Expr:
             if reg == 0:
+                # TJS 调用参数里出现 0 有两种可能：
+                # 1. 真的传 `void`
+                # 2. 中间参数省略，如 `foo(1, , 3)`
+                # 这里会结合后续是否还有实参来区分。
                 has_later_real_arg = False
                 if arg_pos >= 0 and argc > 0:
                     for k in range(arg_pos + 1, argc):
@@ -5411,8 +6160,14 @@ class Decompiler:
             return VarExpr(self._get_temp_name(reg))
 
         if argc == -1:
+            # `argc == -1` 常表示可变参数整体透传，近似为 `...`
             args.append(VarExpr('...'))
         elif argc == -2:
+            # `argc == -2` 表示参数表采用“类型 + 寄存器”对编码。
+            # arg_type:
+            # - 0: 普通参数
+            # - 1: 展开参数，如 `expr*`
+            # - 2: 裸 `*`
             real_argc = ops[start_idx] if start_idx < len(ops) else 0
             for i in range(real_argc):
                 arg_type = ops[start_idx + 1 + i * 2] if start_idx + 1 + i * 2 < len(ops) else 0
@@ -5434,6 +6189,12 @@ class Decompiler:
 
     @staticmethod
     def _get_def_use_regs(op, operands):
+        """抽取单条指令对局部负寄存器的 def/use 集。
+
+        这一步专门服务于后面的数据流分析与寄存器拆分命名。
+        我们只关心 `r < -2` 的局部槽，因为它们最终才会映射成
+        `local0` / `local0_1` 这类源码变量名。
+        """
         defs = set()
         uses = set()
         ops = operands
@@ -5453,6 +6214,10 @@ class Decompiler:
         if op in (VM.ADD, VM.SUB, VM.MUL, VM.DIV, VM.MOD, VM.BAND, VM.BOR,
                   VM.BXOR, VM.SAR, VM.SAL, VM.SR, VM.LOR, VM.LAND, VM.IDIV):
             if nops >= 2:
+                # 就地二元运算：
+                #   ADD local0, local1
+                # 近似于：
+                #   local0 = local0 + local1
                 add_def(ops[0]); add_use(ops[0]); add_use(ops[1])
 
         elif op in (VM.INC, VM.DEC, VM.ASC, VM.CHR, VM.NUM, VM.INT,
@@ -5466,11 +6231,14 @@ class Decompiler:
 
         elif op == VM.CP:
             if nops >= 2:
+                # 赋值/复制：
+                #   CP local0, local1
                 add_def(ops[0]); add_use(ops[1])
         elif op in (VM.CONST, VM.GLOBAL):
             if nops >= 1:
                 add_def(ops[0])
         elif op == VM.CL:
+            # 清空寄存器会影响生命周期，但这里不把它记成普通 use。
             pass
         elif op in (VM.SETF, VM.SETNF):
             if nops >= 1:
@@ -5481,9 +6249,11 @@ class Decompiler:
 
         elif op in (VM.GPD, VM.GPDS):
             if nops >= 2:
+                # dst = obj.prop
                 add_def(ops[0]); add_use(ops[1])
         elif op in (VM.GPI, VM.GPIS):
             if nops >= 3:
+                # dst = obj[idx]
                 add_def(ops[0]); add_use(ops[1]); add_use(ops[2])
         elif op == VM.GETP:
             if nops >= 2:
@@ -5491,9 +6261,11 @@ class Decompiler:
 
         elif op in (VM.SPD, VM.SPDE, VM.SPDEH, VM.SPDS):
             if nops >= 3:
+                # obj.prop = value
                 add_use(ops[0]); add_use(ops[2])
         elif op in (VM.SPI, VM.SPIE, VM.SPIS):
             if nops >= 3:
+                # obj[idx] = value
                 add_use(ops[0]); add_use(ops[1]); add_use(ops[2])
         elif op == VM.SETP:
             if nops >= 2:
@@ -5527,6 +6299,7 @@ class Decompiler:
 
         elif op in (VM.CEQ, VM.CDEQ, VM.CLT, VM.CGT):
             if nops >= 2:
+                # 比较本身主要写 flag，不直接定义本地槽；这里只记录输入。
                 add_use(ops[0]); add_use(ops[1])
 
         elif op in (VM.TT, VM.TF):
@@ -5535,6 +6308,7 @@ class Decompiler:
 
         elif op == VM.CALL:
             if nops >= 3:
+                # 调用族里 argc 可能是特殊负值，表示后面进入展开参数编码。
                 add_def(ops[0]); add_use(ops[1])
                 argc = ops[2]
                 if argc == -2 and nops > 3:
@@ -5635,6 +6409,18 @@ class Decompiler:
         return defs, uses
 
     def _analyze_register_splits(self, instructions, cfg, num_args):
+        """分析哪些负寄存器需要拆成多个源码变量名。
+
+        同一个 TJS2 局部槽位经常会在不同控制流阶段被重复利用，例如：
+            local0 = 1;
+            ...
+            local0 = "text";
+
+        如果直接都反编译成 `local0`，阅读体验会很差，甚至会误以为是同一变量
+        跨类型/跨作用域复用。这里通过 reaching definitions + 并查集，把确实
+        属于不同生命期的定义拆分成不同 component，后续命名时再生成
+        `local0`, `local0_1`, `local0_2` 这类名字。
+        """
         if not instructions or cfg is None:
             return
 
@@ -5648,6 +6434,7 @@ class Decompiler:
 
         for i in range(num_args):
             reg = -(3 + i)
+            # 形参在入口处视为有一个“虚拟定义点 -1”。
             all_defs[reg].append(-1)
 
         addr_to_bid = {}
@@ -5694,6 +6481,8 @@ class Decompiler:
         multi_def_regs = {r for r in multi_def_regs if cl_count.get(r, 0) >= 2}
         if not multi_def_regs:
             return
+        # 只有“被多次清空/复用”的槽位才值得进入拆分分析。
+        # 单纯连续赋值通常还是同一个源码变量。
 
         gen = {}
         kill = {}
@@ -5708,6 +6497,7 @@ class Decompiler:
             for r in multi_def_regs:
                 bd = block_defs[bid].get(r, [])
                 if bd:
+                    # block 内最后一次定义才会活着流出该 block。
                     gen[bid][r] = bd[-1]
                     block_def_set = set(bd)
                     kill[bid][r] = set(all_defs[r]) - block_def_set
@@ -5804,6 +6594,7 @@ class Decompiler:
                 d, u = self._get_def_use_regs(instr.op, instr.operands)
                 for r in u:
                     if r in multi_def_regs:
+                        # 记录每个 use 点此刻可能看到哪些 reaching defs。
                         reaching_at_use[(instr.addr, r)] = set(current_reaching.get(r, set()))
                 for r in d:
                     if r in multi_def_regs:
@@ -5833,6 +6624,8 @@ class Decompiler:
                     continue
                 reaching_list = list(reaching)
                 if len(reaching_list) >= 2:
+                    # 一个 use 若可能来自多个定义，这些定义在源码层面不能拆开，
+                    # 否则该 use 无法归属到唯一变量。
                     for i in range(1, len(reaching_list)):
                         union(reaching_list[0], reaching_list[i])
 
@@ -5842,6 +6635,7 @@ class Decompiler:
                 for instr in instructions[block.start_idx:block.end_idx]:
                     d, u = self._get_def_use_regs(instr.op, instr.operands)
                     if r in u and r in d and cur:
+                        # 自读自写（如 INC local0）表示新旧定义属于同一生命期。
                         for prev_def in cur:
                             union(instr.addr, prev_def)
                     if r in d:
@@ -5886,6 +6680,8 @@ class Decompiler:
                             comp_blocks.add(blk)
                 if len(comp_blocks) <= 1:
                     continue
+                # 仅在多个活跃分量确实分布到不同 block/路径上时才拆名，
+                # 避免把线性代码里的临时覆盖也拆得支离破碎。
 
                 sorted_roots = sorted(live_roots, key=lambda rt: min(root_to_defs[rt]))
 
@@ -5919,26 +6715,48 @@ class Decompiler:
                     if r in split_regs:
                         reaching = current_reaching.get(r, set())
                         if reaching:
+                            # use 点取当前可达定义所属的 component。
                             comp = reg_components[r].get(next(iter(reaching)), 0)
                         else:
                             comp = 0
                         addr_component[(instr.addr, r)] = comp
                 for r in d:
                     if r in split_regs:
+                        # def 点直接落到它自己所在的 component。
                         comp = reg_components[r].get(instr.addr, 0)
                         addr_component[(instr.addr, r)] = comp
                         current_reaching[r] = {instr.addr}
 
         self._reg_splits = {
+            # `(addr, reg) -> component_id`：
+            # 记录“在某条指令地址上，这个负寄存器应被看作哪个生命期分量”。
+            # `_get_local_name()` 会靠它把同一个槽位映射成 `local0` / `local0_1` 等不同名字。
             'addr_component': addr_component,
+            # `reg -> component_count`：
+            # 哪些寄存器被判定需要拆分，以及一共拆出了多少活跃分量。
             'split_regs': split_regs,
         }
 
     def _get_local_name(self, reg: int) -> str:
+        """把负寄存器映射成最终源码里的局部变量名。
+
+        如果该寄存器没有被 `_analyze_register_splits()` 标记为“需要拆分”，
+        就按传统方式分配一个稳定名字，例如 `local0`。
+
+        如果它被拆成了多个 component，则会结合当前翻译到的指令地址
+        `self._current_addr` 去查 `_reg_splits['addr_component']`，决定此刻应该
+        使用哪个分量的名字：
+            reg=-5, comp=0 -> local0
+            reg=-5, comp=1 -> local0_1
+            reg=-5, comp=2 -> local0_2
+
+        这样同一个字节码槽位在不同生命期里就能显示成不同源码变量名。
+        """
         if (self._reg_splits is None or
                 reg not in self._reg_splits['split_regs']):
             if reg in self.local_vars:
                 return self.local_vars[reg]
+            # 没有拆分信息时，一个寄存器槽稳定对应一个名字即可。
             name = f'local{self.var_counter}'
             self.var_counter += 1
             self.local_vars[reg] = name
@@ -5946,23 +6764,30 @@ class Decompiler:
 
         comp = self._reg_splits['addr_component'].get(
             (self._current_addr, reg), 0)
+        # 关键桥接点：
+        # `_analyze_register_splits()` 算出的 component id，在这里真正落成变量名后缀。
+        # 因此同一个物理槽位只要在不同字节码地址命中了不同 component，
+        # `_get_local_name(-5)` 就可能先后返回 `local0`、`local0_1`。
         key = (reg, comp)
         if key in self._split_var_names:
             return self._split_var_names[key]
 
         base_key = (reg, 'base')
         if base_key not in self._split_var_names:
+            # 先给这个“物理槽位”分一个基础名，后续不同 component 共享同一 base。
             base = f'local{self.var_counter}'
             self.var_counter += 1
             self._split_var_names[base_key] = base
 
         base = self._split_var_names[base_key]
+        # 约定 component 0 使用裸名，后续分量再追加 `_1` / `_2` 后缀。
         name = base if comp == 0 else f'{base}_{comp}'
         self._split_var_names[key] = name
         self.local_vars[reg] = name
         return name
 
     def _get_temp_name(self, reg: int) -> str:
+        """给正寄存器这类临时值生成 `tmpN` 风格名字。"""
         if reg in self.local_vars:
             return self.local_vars[reg]
 
@@ -5972,6 +6797,7 @@ class Decompiler:
         return name
 
 def disassemble_object(obj: CodeObject, loader: BytecodeLoader) -> str:
+    """把单个对象格式化成易读的反汇编文本。"""
     lines = []
     ctx_names = ['TopLevel', 'Function', 'ExprFunction', 'Property',
                 'PropertySetter', 'PropertyGetter', 'Class', 'SuperClassGetter']
@@ -5986,6 +6812,7 @@ def disassemble_object(obj: CodeObject, loader: BytecodeLoader) -> str:
 
         extra = ''
         if instr.op == VM.CONST and len(instr.operands) >= 2:
+            # 顺手把常量池里的真实值附在注释里，读反汇编时会省很多脑力。
             idx = instr.operands[1]
             if 0 <= idx < len(obj.data):
                 val = obj.data[idx]
@@ -5994,6 +6821,7 @@ def disassemble_object(obj: CodeObject, loader: BytecodeLoader) -> str:
                 else:
                     extra = f'  ; {val}'
         elif instr.op in (VM.JF, VM.JNF, VM.JMP, VM.ENTRY) and instr.operands:
+            # TJS2 跳转通常保存相对偏移，这里额外算出绝对目标地址。
             target = instr.addr + instr.operands[0]
             extra = f'  ; -> {target}'
 
@@ -6002,6 +6830,7 @@ def disassemble_object(obj: CodeObject, loader: BytecodeLoader) -> str:
     return '\n'.join(lines)
 
 def is_tjs2_bytecode(filepath):
+    """用文件头魔数快速判断一个文件是否像 TJS2 字节码。"""
     try:
         with open(filepath, 'rb') as f:
             return f.read(8) == b'TJS2100\x00'
@@ -6009,6 +6838,13 @@ def is_tjs2_bytecode(filepath):
         return False
 
 def decompile_file(input_path, output_path=None, disasm=False, info=False, obj_idx=None, encoding='utf-16le-bom'):
+    """处理单个 TJS2 文件。
+
+    支持三种模式：
+    - `disasm=True`：只输出反汇编
+    - `info=True`：只输出对象/常量概要
+    - 默认：完整反编译并可写入目标文件
+    """
     try:
         with open(input_path, 'rb') as f:
             data = f.read()
@@ -6050,6 +6886,7 @@ def decompile_file(input_path, output_path=None, disasm=False, info=False, obj_i
     decompiler = CFGDecompiler(loader)
     source = decompiler.decompile()
 
+    # 最后的文本后处理会把结构正确但略显机械的源码整理成人类更易读的样子。
     source = format_source(source)
 
     if output_path:
@@ -6072,6 +6909,7 @@ def decompile_file(input_path, output_path=None, disasm=False, info=False, obj_i
     return True
 
 def decompile_directory(input_dir, output_dir, recursive=False, flat=False, encoding='utf-16le-bom'):
+    """批量反编译目录中的 TJS2 文件。"""
     input_path = pathlib.Path(input_dir)
     output_path = pathlib.Path(output_dir)
 
@@ -6092,6 +6930,7 @@ def decompile_directory(input_dir, output_dir, recursive=False, flat=False, enco
     for filepath in sorted(files):
         rel = filepath.relative_to(input_path)
         if flat:
+            # 扁平输出模式下如果重名，就自动追加 `_1`、`_2` ... 以避免覆盖。
             name = filepath.name
             if name in seen_names:
                 seen_names[name] += 1
@@ -6117,6 +6956,7 @@ def decompile_directory(input_dir, output_dir, recursive=False, flat=False, enco
     print(f"\nDone: {ok} succeeded, {fail} failed, {ok + fail} total")
 
 def main():
+    """命令行入口。"""
     parser = argparse.ArgumentParser(description='TJS2 Bytecode Decompiler')
     parser.add_argument('input', help='Input bytecode file or directory')
     parser.add_argument('-o', '--output', help='Output file or directory')

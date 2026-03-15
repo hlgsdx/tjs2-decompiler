@@ -1,9 +1,29 @@
+"""反编译输出源码的后处理格式化器。
+
+反编译器前半段更关注“语义正确”，这里则专门负责把已经恢复出的 TJS2
+源码整理得更像人类书写的风格，包括：
+
+1. 长行拆分；
+2. 匿名函数缩进修复；
+3. 继承 / `super` / 默认参数等语法糖回填；
+4. 空行、`else if`、空块等版式微调。
+
+注意：这个模块原则上不应改变程序语义，只做保守的文本层重写。
+"""
+
 import re
 
 MAX_LINE_LENGTH = 120
 INDENT_STR = '    '
 
 def format_source(source: str) -> str:
+    """执行整套源码格式化流水线。
+
+    顺序很重要：
+    - 先修匿名函数缩进和长行，避免后续基于行结构的规则误判；
+    - 再恢复默认参数、继承、`super` 等语法糖；
+    - 最后统一空行和 catch 变量等风格问题。
+    """
     max_line = MAX_LINE_LENGTH
 
     source = _fix_anon_func_indent(source)
@@ -59,6 +79,7 @@ def format_source(source: str) -> str:
     return source
 
 def _fix_anon_func_indent(source: str) -> str:
+    """循环执行匿名函数缩进修复，直到结果稳定。"""
     while True:
         new_source = _fix_anon_func_indent_pass(source)
         if new_source == source:
@@ -67,6 +88,7 @@ def _fix_anon_func_indent(source: str) -> str:
     return source
 
 def _scan_brace_depth(line, initial_depth):
+    """扫描单行里的大括号深度变化，忽略字符串中的花括号。"""
     depth = initial_depth
     in_string = None
     j = 0
@@ -90,6 +112,18 @@ def _scan_brace_depth(line, initial_depth):
     return False, depth
 
 def _fix_anon_func_indent_pass(source: str) -> str:
+    """执行一轮匿名函数体缩进修正。
+
+    反编译输出里常会出现这种情况：
+
+    ```tjs
+    foo = function() {
+    bar();
+    }
+    ```
+
+    这一轮会把函数体整体右移到合理缩进层级。
+    """
     lines = source.split('\n')
     result = []
     i = 0
@@ -140,11 +174,17 @@ def _fix_anon_func_indent_pass(source: str) -> str:
     return '\n'.join(result)
 
 def _get_indent(line: str) -> tuple:
+    """拆出一行的缩进部分与去缩进后的正文。"""
     stripped = line.lstrip()
     indent = line[:len(line) - len(stripped)]
     return indent, stripped
 
 def _format_long_line(line: str, max_line: int = MAX_LINE_LENGTH) -> list:
+    """尝试把超长单行拆成多行。
+
+    这里按“字典、数组、条件、三元、调用、return”等模式依次尝试，
+    谁先匹配成功就采用谁的拆分策略。
+    """
     indent, content = _get_indent(line)
     inner_indent = indent + INDENT_STR
 
@@ -167,6 +207,7 @@ def _format_long_line(line: str, max_line: int = MAX_LINE_LENGTH) -> list:
     return [line]
 
 def _find_matching_bracket(text: str, open_pos: int, open_char: str, close_char: str) -> int:
+    """在忽略字符串内容的前提下，查找匹配括号位置。"""
     depth = 1
     pos = open_pos + 1
     in_string = None
@@ -189,6 +230,12 @@ def _find_matching_bracket(text: str, open_pos: int, open_char: str, close_char:
     return pos - 1 if depth == 0 else -1
 
 def _split_top_level(text: str, separator: str = ',') -> list:
+    """按顶层分隔符切分文本。
+
+    只有在括号/方括号/花括号深度都为 0 时才真正切分，因此可以安全处理：
+    - `foo(a, bar(1, 2), c)`
+    - `%["k", [1, 2], function() { ... }]`
+    """
     parts = []
     current = []
     depth_paren = 0
@@ -246,6 +293,7 @@ def _split_top_level(text: str, separator: str = ',') -> list:
     return parts
 
 def _try_format_dict(content: str, indent: str, inner_indent: str) -> list:
+    """尝试拆分 `%[...]` 形式的字典字面量。"""
     m = re.search(r'%\[', content)
     if not m:
         return None
@@ -291,6 +339,7 @@ def _try_format_dict(content: str, indent: str, inner_indent: str) -> list:
         return lines
 
 def _try_format_array(content: str, indent: str, inner_indent: str) -> list:
+    """尝试拆分数组字面量，同时避开 `%[...]` 字典语法。"""
     for m in re.finditer(r'\[', content):
         bracket_start = m.start()
         if bracket_start > 0 and content[bracket_start - 1] == '%':
@@ -349,6 +398,7 @@ def _try_format_array(content: str, indent: str, inner_indent: str) -> list:
     return None
 
 def _try_format_call(content: str, indent: str, inner_indent: str) -> list:
+    """尝试拆分参数过长的函数/方法调用。"""
     full_line = indent + content
     if len(full_line) <= MAX_LINE_LENGTH:
         return None
@@ -423,6 +473,7 @@ def _try_format_call(content: str, indent: str, inner_indent: str) -> list:
     return lines
 
 def _try_format_condition(content: str, indent: str, inner_indent: str) -> list:
+    """尝试拆分 `if/while/for` 或 `return` 后面的长条件表达式。"""
     full_line = indent + content
     if len(full_line) <= MAX_LINE_LENGTH:
         return None
@@ -464,6 +515,7 @@ def _try_format_condition(content: str, indent: str, inner_indent: str) -> list:
     return lines
 
 def _try_format_return_condition(content, indent, inner_indent, m):
+    """专门处理 `return a && b && c;` 这类长逻辑返回。"""
     prefix = m.group(1)
     rest = content[m.end():]
     if rest.endswith(';'):
@@ -488,6 +540,7 @@ def _try_format_return_condition(content, indent, inner_indent, m):
     return lines
 
 def _try_format_condition_continuation(content, indent, inner_indent, m):
+    """处理上一行已经拆开的 `&& ...` / `|| ...` 续行。"""
     op_prefix = m.group(1)
     rest = content[m.end():]
 
@@ -529,6 +582,11 @@ def _try_format_condition_continuation(content, indent, inner_indent, m):
 
 def _greedy_condition_wrap(prefix: str, inner_rest: str, suffix: str,
                            indent: str) -> list:
+    """贪心式条件换行。
+
+    当按逻辑运算符拆开后仍有超长行，就尽量在不超过列宽的前提下把更多片段
+    合并到同一行，避免输出过于碎片化。
+    """
     segments = _find_all_logical_segments(inner_rest)
     if len(segments) <= 1:
         return None
@@ -551,6 +609,7 @@ def _greedy_condition_wrap(prefix: str, inner_rest: str, suffix: str,
     return lines
 
 def _find_all_logical_segments(text: str) -> list:
+    """把条件表达式切成 `a`、`&& b`、`|| c` 这样的逻辑片段。"""
     segments = []
     current = []
     in_string = None
@@ -587,6 +646,7 @@ def _find_all_logical_segments(text: str) -> list:
     return segments
 
 def _try_format_ternary(content: str, indent: str, inner_indent: str) -> list:
+    """尝试拆分三元表达式。"""
     full_line = indent + content
     if len(full_line) <= MAX_LINE_LENGTH:
         return None
